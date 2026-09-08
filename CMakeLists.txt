@@ -271,6 +271,7 @@ set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location o
 
 set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-slang-paged.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
 
 set_target_properties(llama

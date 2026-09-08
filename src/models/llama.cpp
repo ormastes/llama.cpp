@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-memory-slang-paged-cache.h"
 
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     uint32_t n_vocab = 0;
@@ -110,13 +111,15 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
-
-    inp_attn_type * inp_attn = nullptr;
+    llm_graph_input_attn_no_cache * inp_attn_no_cache = nullptr;
+    llm_graph_input_attn_kv * inp_attn_kv = nullptr;
+    llm_graph_input_attn_slang_paged * inp_attn_paged = nullptr;
     if constexpr (embed) {
-        inp_attn = build_attn_inp_no_cache();
+        inp_attn_no_cache = build_attn_inp_no_cache();
+    } else if (dynamic_cast<const llama_memory_slang_paged_context *>(mctx) != nullptr) {
+        inp_attn_paged = build_attn_inp_slang_paged();
     } else {
-        inp_attn = build_attn_inp_kv();
+        inp_attn_kv = build_attn_inp_kv();
     }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -166,9 +169,19 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 cb(Qcur, "Qcur_normed", il);
                 cb(Kcur, "Kcur_normed", il);
             }
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            if (inp_attn_paged) {
+                cur = build_attn(inp_attn_paged,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, kq_scale, il);
+            } else if constexpr (embed) {
+                cur = build_attn(inp_attn_no_cache,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            } else {
+                cur = build_attn(inp_attn_kv,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            }
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {

@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_slang_paged_params;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -43,7 +44,8 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+            const llama_slang_paged_params * paged = nullptr);
 
     ~llama_context();
 
@@ -72,6 +74,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    bool uses_slang_paged_memory() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);

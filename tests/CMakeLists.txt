@@ -294,6 +294,11 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
+if (NOT GGML_BACKEND_DL AND NOT (WIN32 AND BUILD_SHARED_LIBS))
+    llama_build_and_test(test-slang-paged-model.cpp ARGS "${MODEL_DEST}")
+    set_tests_properties(test-slang-paged-model PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
+
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
@@ -324,14 +329,18 @@ target_include_directories(test-slang-paged-requests PRIVATE ../src)
 target_compile_features(test-slang-paged-requests PRIVATE cxx_std_17)
 llama_test(test-slang-paged-requests)
 
-add_executable(test-slang-paged-attention
-    test-slang-paged-attention.cpp
-    ../src/llama-memory-slang-paged.cpp
-    ../src/llama-slang-paged-requests.cpp
-    ../src/llama-slang-paged-attention.cpp)
-target_include_directories(test-slang-paged-attention PRIVATE ../src)
-target_compile_features(test-slang-paged-attention PRIVATE cxx_std_17)
-llama_test(test-slang-paged-attention)
+if (NOT GGML_BACKEND_DL AND NOT (WIN32 AND BUILD_SHARED_LIBS))
+    add_executable(test-slang-paged-attention
+        test-slang-paged-attention.cpp
+        ../src/llama-memory-slang-paged.cpp
+        ../src/llama-slang-paged-requests.cpp
+        ../src/llama-slang-paged-attention.cpp)
+    target_include_directories(test-slang-paged-attention PRIVATE ../src)
+    target_link_libraries(test-slang-paged-attention PRIVATE ggml-cpu)
+    target_compile_definitions(test-slang-paged-attention PRIVATE LLAMA_SLANG_PAGED_CPU_DIRECT)
+    target_compile_features(test-slang-paged-attention PRIVATE cxx_std_17)
+    llama_test(test-slang-paged-attention)
+endif()
 
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473

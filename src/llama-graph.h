@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+
+class llama_memory_slang_paged_context;
 #include <memory>
 #include <set>
 #include <functional>
@@ -316,6 +318,26 @@ public:
 
     const llama_hparams hparams;
     const llama_cparams cparams;
+};
+
+class llm_graph_input_attn_slang_paged final : public llm_graph_input_i {
+public:
+    struct callback_state {
+        llama_memory_slang_paged_context * mctx;
+        uint32_t layer;
+    };
+
+    llm_graph_input_attn_slang_paged(llama_memory_slang_paged_context * mctx, uint32_t n_layer) :
+        mctx(mctx), states(n_layer) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            states[il] = { mctx, il };
+        }
+    }
+
+    void set_input(const llama_ubatch *) override {}
+
+    llama_memory_slang_paged_context * mctx;
+    std::vector<callback_state> states;
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
@@ -1190,6 +1212,19 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+
+    llm_graph_input_attn_slang_paged * build_attn_inp_slang_paged() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_slang_paged * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                  float   kq_scale,
+                    int   il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_no_cache * inp,

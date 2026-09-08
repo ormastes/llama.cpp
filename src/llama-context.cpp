@@ -1,4 +1,6 @@
 #include "llama-context.h"
+#include "llama-memory-slang-paged-cache.h"
+#include "llama-slang-paged.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -82,11 +84,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+        const llama_slang_paged_params * paged) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    graph_reuse_disable = paged != nullptr;
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -392,7 +396,11 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        memory.reset(paged ? llama_memory_slang_paged_cache::create(model, params_mem, cparams, *paged).release() :
+                             model.create_memory(params_mem, cparams));
+        if (paged && !memory) {
+            throw std::runtime_error("unsupported Slang paged context configuration");
+        }
     }
 
     // init backends
@@ -787,6 +795,10 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+bool llama_context::uses_slang_paged_memory() const {
+    return dynamic_cast<llama_memory_slang_paged_cache *>(memory.get()) != nullptr;
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -1827,6 +1839,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (mctx->requires_finalize()) {
+                mctx->abort();
+                n_outputs = 0;
+                switch (status) {
+                    case GGML_STATUS_ABORTED:      return  2;
+                    case GGML_STATUS_ALLOC_FAILED: return -2;
+                    case GGML_STATUS_FAILED:       return -3;
+                    case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                }
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -1870,6 +1892,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        float * transaction_logits = nullptr;
+
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
@@ -1877,6 +1901,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(logits.data != nullptr);
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            transaction_logits = logits_out;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
@@ -1974,6 +1999,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+
+        if (mctx->requires_finalize()) {
+            synchronize();
+            const llama_pos final_position = ubatch.pos[ubatch.n_tokens - 1];
+            if (!mctx->finalize(transaction_logits, n_vocab, final_position)) {
+                LLAMA_LOG_ERROR("%s: transactional memory publication failed\n", __func__);
+                n_outputs = 0;
+                return -3;
+            }
         }
 
         n_outputs_prev += n_outputs;
@@ -3657,11 +3692,18 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+static llama_context * llama_init_from_model_impl(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params,
+ const llama_slang_paged_params * paged) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+        return nullptr;
+    }
+
+    if (paged && (params.n_samplers != 0 || params.samplers != nullptr || params.ctx_other != nullptr ||
+                  params.embeddings)) {
+        LLAMA_LOG_ERROR("%s: unsupported Slang paged context option\n", __func__);
         return nullptr;
     }
 
@@ -3744,7 +3786,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, paged);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -3759,6 +3801,19 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(
+                 llama_model * model,
+        llama_context_params   params) {
+    return llama_init_from_model_impl(model, params, nullptr);
+}
+
+llama_context * llama_init_from_model_slang_paged(
+                 llama_model * model,
+        llama_context_params   params,
+ llama_slang_paged_params      paged) {
+    return llama_init_from_model_impl(model, params, &paged);
 }
 
 // deprecated
@@ -3832,10 +3887,18 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
+    if (ctx->uses_slang_paged_memory() && embeddings) {
+        LLAMA_LOG_ERROR("%s: embeddings are unsupported by Slang paged contexts\n", __func__);
+        return;
+    }
     ctx->set_embeddings(embeddings);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+    if (ctx->uses_slang_paged_memory() && !causal_attn) {
+        LLAMA_LOG_ERROR("%s: non-causal attention is unsupported by Slang paged contexts\n", __func__);
+        return;
+    }
     ctx->set_causal_attn(causal_attn);
 }
 
@@ -3886,10 +3949,18 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+    if (ctx->uses_slang_paged_memory() && value) {
+        LLAMA_LOG_ERROR("%s: next-token embeddings are unsupported by Slang paged contexts\n", __func__);
+        return;
+    }
     ctx->set_embeddings_nextn(value, masked);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+    if (ctx->uses_slang_paged_memory() && value) {
+        LLAMA_LOG_ERROR("%s: layer-input embeddings are unsupported by Slang paged contexts\n", __func__);
+        return;
+    }
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
@@ -3924,6 +3995,10 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
+    if (ctx->uses_slang_paged_memory() && smpl != nullptr) {
+        LLAMA_LOG_ERROR("%s: backend samplers are unsupported by Slang paged contexts\n", __func__);
+        return false;
+    }
     return ctx->set_sampler(seq_id, smpl);
 }
 
@@ -3993,6 +4068,11 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
+    if (ctx->uses_slang_paged_memory() && n_adapters != 0) {
+        LLAMA_LOG_ERROR("%s: adapters are unsupported by Slang paged contexts\n", __func__);
+        return -1;
+    }
+
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
@@ -4005,6 +4085,10 @@ int32_t llama_set_adapter_cvec(
               int32_t   n_embd,
               int32_t   il_start,
               int32_t   il_end) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: control vectors are unsupported by Slang paged contexts\n", __func__);
+        return -1;
+    }
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
@@ -4141,10 +4225,18 @@ bool llama_save_session_file(llama_context * ctx, const char * path_session, con
 // Returns the *actual* size of the state.
 // Intended to be used when saving to state to a buffer.
 size_t llama_state_get_size(llama_context * ctx) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     return ctx->state_get_size();
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_get_data(dst, size);
@@ -4152,6 +4244,10 @@ size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_set_data(src, size);
@@ -4192,15 +4288,27 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     return ctx->state_seq_get_size(seq_id, flags);
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx->uses_slang_paged_memory()) {
+        LLAMA_LOG_ERROR("%s: state serialization is unsupported by Slang paged contexts\n", __func__);
+        return 0;
+    }
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
