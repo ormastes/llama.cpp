@@ -15,7 +15,7 @@ static void require(bool condition, const char * expression, int line) {
 
 int main() {
     llama_slang_paged_pool::layout layout = {
-        2, 4, 2, 3, 2, 2 * 2 * 4 * 2 * 3 * sizeof(float) * 2, 2 * 1024,
+        2, 4, 2, 3, 2, 7, 2 * 2 * 4 * 2 * 3 * sizeof(float) * 2, 2 * 1024,
     };
     auto pool = llama_slang_paged_pool::create(layout);
     REQUIRE(pool != nullptr);

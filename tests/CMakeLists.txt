@@ -316,6 +316,14 @@ target_compile_features(test-slang-paged-kv-pool PRIVATE cxx_std_17)
 target_compile_definitions(test-slang-paged-kv-pool PRIVATE LLAMA_SLANG_PAGED_TESTING)
 llama_test(test-slang-paged-kv-pool)
 
+add_executable(test-slang-paged-requests
+    test-slang-paged-requests.cpp
+    ../src/llama-memory-slang-paged.cpp
+    ../src/llama-slang-paged-requests.cpp)
+target_include_directories(test-slang-paged-requests PRIVATE ../src)
+target_compile_features(test-slang-paged-requests PRIVATE cxx_std_17)
+llama_test(test-slang-paged-requests)
+
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473
 if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)

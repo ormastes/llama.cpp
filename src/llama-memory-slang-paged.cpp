@@ -34,7 +34,8 @@ bool checked_mul(size_t a, size_t b, size_t & result) {
 
 std::unique_ptr<llama_slang_paged_pool> llama_slang_paged_pool::create(const layout & config) {
     if (config.n_layer == 0 || config.page_tokens == 0 || config.n_head_kv == 0 || config.head_dim == 0 ||
-        config.page_capacity == 0 || config.byte_limit == 0 || config.descriptor_byte_limit == 0) {
+        config.page_capacity == 0 || config.execution_namespace == 0 || config.byte_limit == 0 ||
+        config.descriptor_byte_limit == 0) {
         return nullptr;
     }
 
@@ -122,15 +123,19 @@ llama_slang_paged_pool::page_handle llama_slang_paged_pool::reserve() {
         return 0;
     }
     std::memset(available->data, 0, page_bytes_);
-    available->occupied                   = 0;
-    available->mapping_references         = 0;
-    available->read_borrows               = 0;
-    available->writable_owner             = 0;
-    available->exclusive_transaction      = 0;
-    available->exclusive_request          = 0;
-    available->exclusive_initial_occupied = 0;
-    available->identity                   = identity;
-    available->state                      = page_state::writable;
+    available->occupied                         = 0;
+    available->mapping_references               = 0;
+    available->read_borrows                     = 0;
+    available->writable_owner                   = 0;
+    available->exclusive_transaction            = 0;
+    available->exclusive_request                = 0;
+    available->exclusive_initial_occupied       = 0;
+    available->position_base                    = 0;
+    available->exclusive_initial_position       = 0;
+    available->position_bound                   = false;
+    available->exclusive_initial_position_bound = false;
+    available->identity                         = identity;
+    available->state                            = page_state::writable;
     allocated_bytes_ += page_bytes_;
     return identity;
 }
@@ -142,16 +147,20 @@ bool llama_slang_paged_pool::release(page_handle handle) {
         return false;
     }
     ::operator delete(page->data, std::align_val_t(64));
-    page->data                       = nullptr;
-    page->identity                   = 0;
-    page->occupied                   = 0;
-    page->mapping_references         = 0;
-    page->read_borrows               = 0;
-    page->writable_owner             = 0;
-    page->exclusive_transaction      = 0;
-    page->exclusive_request          = 0;
-    page->exclusive_initial_occupied = 0;
-    page->state                      = page_state::free;
+    page->data                             = nullptr;
+    page->identity                         = 0;
+    page->occupied                         = 0;
+    page->mapping_references               = 0;
+    page->read_borrows                     = 0;
+    page->writable_owner                   = 0;
+    page->exclusive_transaction            = 0;
+    page->exclusive_request                = 0;
+    page->exclusive_initial_occupied       = 0;
+    page->position_base                    = 0;
+    page->exclusive_initial_position       = 0;
+    page->position_bound                   = false;
+    page->exclusive_initial_position_bound = false;
+    page->state                            = page_state::free;
     allocated_bytes_ -= page_bytes_;
     return true;
 }
@@ -212,7 +221,22 @@ bool llama_slang_paged_pool::copy_rows(page_handle source, page_handle destinati
         std::memcpy(dst->data + row_offset(false, layer, 0), src->data + row_offset(false, layer, 0), bytes);
         std::memcpy(dst->data + row_offset(true, layer, 0), src->data + row_offset(true, layer, 0), bytes);
     }
-    dst->occupied = rows;
+    dst->occupied       = rows;
+    dst->position_base  = src->position_base;
+    dst->position_bound = src->position_bound;
+    return true;
+}
+
+bool llama_slang_paged_pool::bind_position_exclusive(page_handle handle, uint64_t transaction, uint64_t position_base) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction) {
+        return false;
+    }
+    if (page->position_bound) {
+        return page->position_base == position_base;
+    }
+    page->position_base  = position_base;
+    page->position_bound = true;
     return true;
 }
 
@@ -273,9 +297,11 @@ bool llama_slang_paged_pool::claim_exclusive(page_handle handle, uint64_t transa
         page->writable_owner != 0) {
         return false;
     }
-    page->exclusive_transaction      = transaction;
-    page->exclusive_request          = request;
-    page->exclusive_initial_occupied = page->occupied;
+    page->exclusive_transaction            = transaction;
+    page->exclusive_request                = request;
+    page->exclusive_initial_occupied       = page->occupied;
+    page->exclusive_initial_position       = page->position_base;
+    page->exclusive_initial_position_bound = page->position_bound;
     return true;
 }
 
@@ -290,11 +316,15 @@ bool llama_slang_paged_pool::abort_exclusive(page_handle handle, uint64_t transa
         std::memset(page->data + row_offset(false, layer, page->exclusive_initial_occupied), 0, clear_bytes);
         std::memset(page->data + row_offset(true, layer, page->exclusive_initial_occupied), 0, clear_bytes);
     }
-    page->occupied                   = page->exclusive_initial_occupied;
-    page->state                      = page_state::writable;
-    page->exclusive_transaction      = 0;
-    page->exclusive_request          = 0;
-    page->exclusive_initial_occupied = 0;
+    page->occupied                         = page->exclusive_initial_occupied;
+    page->state                            = page_state::writable;
+    page->position_base                    = page->exclusive_initial_position;
+    page->position_bound                   = page->exclusive_initial_position_bound;
+    page->exclusive_transaction            = 0;
+    page->exclusive_request                = 0;
+    page->exclusive_initial_occupied       = 0;
+    page->exclusive_initial_position       = 0;
+    page->exclusive_initial_position_bound = false;
     return true;
 }
 
@@ -304,11 +334,13 @@ bool llama_slang_paged_pool::publish_exclusive(page_handle handle, uint64_t tran
         page->exclusive_request != request || page->mapping_references != 0 || page->writable_owner != 0) {
         return false;
     }
-    page->mapping_references         = 1;
-    page->writable_owner             = page->state == page_state::writable ? request : 0;
-    page->exclusive_transaction      = 0;
-    page->exclusive_request          = 0;
-    page->exclusive_initial_occupied = 0;
+    page->mapping_references               = 1;
+    page->writable_owner                   = page->state == page_state::writable ? request : 0;
+    page->exclusive_transaction            = 0;
+    page->exclusive_request                = 0;
+    page->exclusive_initial_occupied       = 0;
+    page->exclusive_initial_position       = 0;
+    page->exclusive_initial_position_bound = false;
     return true;
 }
 
@@ -369,6 +401,16 @@ uint32_t llama_slang_paged_pool::read_borrows(page_handle handle) const {
 uint64_t llama_slang_paged_pool::exclusive_transaction(page_handle handle) const {
     const page * page = find(handle);
     return page == nullptr ? 0 : page->exclusive_transaction;
+}
+
+bool llama_slang_paged_pool::position_bound(page_handle handle) const {
+    const page * page = find(handle);
+    return page != nullptr && page->position_bound;
+}
+
+uint64_t llama_slang_paged_pool::position_base(page_handle handle) const {
+    const page * page = find(handle);
+    return page == nullptr || !page->position_bound ? 0 : page->position_base;
 }
 
 size_t llama_slang_paged_pool::page_bytes() const {
