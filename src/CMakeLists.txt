@@ -35,6 +35,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-memory-slang-paged.cpp
             llama-slang-paged-requests.cpp
+            llama-slang-paged-attention.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp

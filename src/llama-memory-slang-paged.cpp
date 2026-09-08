@@ -207,6 +207,19 @@ const float * llama_slang_paged_pool::row(page_handle handle, bool value, uint32
     return page->data + row_offset(value, layer, row);
 }
 
+const float * llama_slang_paged_pool::row_exclusive(page_handle handle,
+                                                    uint64_t    transaction,
+                                                    bool        value,
+                                                    uint32_t    layer,
+                                                    uint32_t    row) const {
+    const page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction || layer >= config_.n_layer ||
+        row >= page->occupied) {
+        return nullptr;
+    }
+    return page->data + row_offset(value, layer, row);
+}
+
 bool llama_slang_paged_pool::copy_rows(page_handle source, page_handle destination, uint32_t rows) {
     const page * src = find(source);
     page *       dst = find(destination);

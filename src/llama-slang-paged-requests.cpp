@@ -56,14 +56,17 @@ std::unique_ptr<llama_slang_paged_requests> llama_slang_paged_requests::create(
     size_t transaction_bytes = 0;
     size_t published_bytes   = 0;
     size_t staged_bytes      = 0;
+    size_t progress_bytes    = 0;
     if (!checked_mul(config.max_requests, config.max_pages_per_request, slots) ||
         !checked_mul(config.max_requests, sizeof(request_record), request_bytes) ||
         !checked_mul(config.max_requests, sizeof(transaction_record), transaction_bytes) ||
         !checked_mul(slots, sizeof(published_entry), published_bytes) ||
         !checked_mul(slots, sizeof(staged_entry), staged_bytes) ||
+        !checked_mul(slots, pool->config().n_layer, progress_bytes) ||
         !checked_add(request_bytes, transaction_bytes, metadata_bytes) ||
         !checked_add(metadata_bytes, published_bytes, metadata_bytes) ||
-        !checked_add(metadata_bytes, staged_bytes, metadata_bytes) || metadata_bytes > config.metadata_byte_limit) {
+        !checked_add(metadata_bytes, staged_bytes, metadata_bytes) ||
+        !checked_add(metadata_bytes, progress_bytes, metadata_bytes) || metadata_bytes > config.metadata_byte_limit) {
         return nullptr;
     }
 
@@ -93,7 +96,8 @@ llama_slang_paged_requests::llama_slang_paged_requests(std::shared_ptr<llama_sla
     published_(size_t(config.max_requests) * config.max_pages_per_request),
     staged_(size_t(config.max_requests) * config.max_pages_per_request),
     published_logits_(size_t(config.max_requests) * config.vocabulary_width),
-    staged_logits_(size_t(config.max_requests) * config.vocabulary_width) {}
+    staged_logits_(size_t(config.max_requests) * config.vocabulary_width),
+    layer_progress_(size_t(config.max_requests) * config.max_pages_per_request * pool_->config().n_layer) {}
 
 llama_slang_paged_requests::~llama_slang_paged_requests() {
     for (size_t i = 0; i < requests_.size(); ++i) {
@@ -166,6 +170,14 @@ float * llama_slang_paged_requests::staged_logits_slice(size_t index) {
     return staged_logits_.data() + index * config_.vocabulary_width;
 }
 
+uint8_t * llama_slang_paged_requests::layer_progress_slice(size_t index, uint32_t entry) {
+    return layer_progress_.data() + (index * config_.max_pages_per_request + entry) * pool_->config().n_layer;
+}
+
+const uint8_t * llama_slang_paged_requests::layer_progress_slice(size_t index, uint32_t entry) const {
+    return layer_progress_.data() + (index * config_.max_pages_per_request + entry) * pool_->config().n_layer;
+}
+
 llama_slang_paged_requests::request_handle llama_slang_paged_requests::open_request(uint64_t execution_namespace) {
     if (execution_namespace == 0 || execution_namespace != pool_->config().execution_namespace) {
         return 0;
@@ -235,6 +247,7 @@ llama_slang_paged_requests::transaction_handle llama_slang_paged_requests::begin
     transactions_[index] = { identity, request, table_base, expected_pages, 0, 0, true, false, false };
     std::fill_n(staged_slice(index), config_.max_pages_per_request, staged_entry{});
     std::fill_n(staged_logits_slice(index), config_.vocabulary_width, 0.0f);
+    std::fill_n(layer_progress_slice(index, 0), size_t(config_.max_pages_per_request) * pool_->config().n_layer, 0);
     return identity;
 }
 
@@ -340,12 +353,38 @@ bool llama_slang_paged_requests::finish_rows(transaction_handle transaction, uin
         return fail_valid(*record);
     }
     staged_entry & staged = staged_slice(request_index(*request))[entry];
+    if (new_valid > staged.initial_rows) {
+        const uint8_t * progress = layer_progress_slice(request_index(*request), entry);
+        for (uint32_t layer = 0; layer < pool_->config().n_layer; ++layer) {
+            if (progress[layer] == 0) {
+                return fail_valid(*record);
+            }
+        }
+    }
     if (!staged.exclusive || new_valid < staged.valid_rows || new_valid > staged.writable_end ||
         !pool_->set_occupied_exclusive(staged.page, transaction, new_valid)) {
         return fail_valid(*record);
     }
     staged.valid_rows    = new_valid;
     record->logits_valid = false;
+    return true;
+}
+
+bool llama_slang_paged_requests::mark_layer_written(transaction_handle transaction, uint32_t entry, uint32_t layer) {
+    transaction_record * record = find_transaction(transaction);
+    if (record == nullptr || record->failed) {
+        return false;
+    }
+    request_record * request = find_request(record->request);
+    if (request == nullptr || entry >= record->staged_count || layer >= pool_->config().n_layer) {
+        return fail_valid(*record);
+    }
+    const staged_entry & staged   = staged_slice(request_index(*request))[entry];
+    uint8_t *            progress = layer_progress_slice(request_index(*request), entry);
+    if (!staged.exclusive || staged.writable_end <= staged.initial_rows || progress[layer] != 0) {
+        return fail_valid(*record);
+    }
+    progress[layer] = 1;
     return true;
 }
 
@@ -494,6 +533,7 @@ void llama_slang_paged_requests::clear_transaction(size_t index) {
     transactions_[index] = {};
     std::fill_n(staged_slice(index), config_.max_pages_per_request, staged_entry{});
     std::fill_n(staged_logits_slice(index), config_.vocabulary_width, 0.0f);
+    std::fill_n(layer_progress_slice(index, 0), size_t(config_.max_pages_per_request) * pool_->config().n_layer, 0);
 }
 
 bool llama_slang_paged_requests::abort_record(size_t index) {
@@ -546,4 +586,66 @@ const float * llama_slang_paged_requests::logits(request_handle request) const {
 bool llama_slang_paged_requests::logits_valid(request_handle request) const {
     const request_record * record = find_request(request);
     return record != nullptr && record->logits_valid;
+}
+
+uint32_t llama_slang_paged_requests::execution_count(transaction_handle transaction) const {
+    const transaction_record * record = find_transaction(transaction);
+    return record == nullptr || record->failed ? 0 : record->staged_count;
+}
+
+bool llama_slang_paged_requests::execution_compatible(transaction_handle transaction,
+                                                      uint32_t           n_layer,
+                                                      uint32_t           n_head_kv,
+                                                      uint32_t           head_dim) const {
+    const transaction_record * record = find_transaction(transaction);
+    const auto &               config = pool_->config();
+    return record != nullptr && !record->failed && config.n_layer == n_layer && config.n_head_kv == n_head_kv &&
+           config.head_dim == head_dim;
+}
+
+bool llama_slang_paged_requests::execution_entry_at(transaction_handle transaction,
+                                                    uint32_t           index,
+                                                    execution_entry &  result) const {
+    const transaction_record * record = find_transaction(transaction);
+    if (record == nullptr || record->failed || index >= record->staged_count) {
+        return false;
+    }
+    const request_record * request = find_request(record->request);
+    if (request == nullptr) {
+        return false;
+    }
+    const staged_entry & entry = staged_[request_index(*request) * config_.max_pages_per_request + index];
+    result = { entry.page, entry.valid_rows, entry.writable_end,
+               record->table_base + uint64_t(index) * pool_->config().page_tokens, entry.exclusive };
+    return true;
+}
+
+bool llama_slang_paged_requests::layer_unwritten(transaction_handle transaction, uint32_t entry, uint32_t layer) const {
+    const transaction_record * record = find_transaction(transaction);
+    if (record == nullptr || record->failed || entry >= record->staged_count || layer >= pool_->config().n_layer) {
+        return false;
+    }
+    const request_record * request = find_request(record->request);
+    return request != nullptr && layer_progress_slice(request_index(*request), entry)[layer] == 0;
+}
+
+const float * llama_slang_paged_requests::readable_row(transaction_handle transaction,
+                                                       uint32_t           entry_index,
+                                                       bool               value,
+                                                       uint32_t           layer,
+                                                       uint32_t           row) const {
+    const transaction_record * record = find_transaction(transaction);
+    if (record == nullptr || record->failed || entry_index >= record->staged_count) {
+        return nullptr;
+    }
+    const request_record * request = find_request(record->request);
+    if (request == nullptr) {
+        return nullptr;
+    }
+    const staged_entry & entry = staged_[request_index(*request) * config_.max_pages_per_request + entry_index];
+    if (row >= entry.valid_rows) {
+        return nullptr;
+    }
+    return entry.exclusive ? pool_->row_exclusive(entry.page, transaction, value, layer, row) :
+                             pool_->row(entry.page, value, layer, row);
 }
