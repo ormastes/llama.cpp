@@ -59,6 +59,11 @@ class llama_slang_paged_pool {
     float * writable_row(page_handle handle, bool value, uint32_t layer, uint32_t row);
     float * writable_row_exclusive(page_handle handle, uint64_t transaction, bool value, uint32_t layer, uint32_t row);
     const float * row(page_handle handle, bool value, uint32_t layer, uint32_t row) const;
+    const float * row_exclusive(page_handle handle,
+                                uint64_t    transaction,
+                                bool        value,
+                                uint32_t    layer,
+                                uint32_t    row) const;
 
     page_state     state(page_handle handle) const;
     uint32_t       occupied(page_handle handle) const;

@@ -29,6 +29,14 @@ class llama_slang_paged_requests {
         uint64_t    position_base;
     };
 
+    struct execution_entry {
+        page_handle page;
+        uint32_t    readable_rows;
+        uint32_t    writable_end;
+        uint64_t    position_base;
+        bool        exclusive;
+    };
+
     static std::unique_ptr<llama_slang_paged_requests> create(std::shared_ptr<llama_slang_paged_pool> pool,
                                                               const limits &                          config);
 
@@ -43,6 +51,7 @@ class llama_slang_paged_requests {
     transaction_handle begin(request_handle request, uint64_t table_base, uint32_t expected_pages);
     bool    push(transaction_handle transaction, page_handle page, uint32_t valid_rows, uint32_t writable_capacity);
     float * writable_row(transaction_handle transaction, uint32_t entry, bool value, uint32_t layer, uint32_t row);
+    bool    mark_layer_written(transaction_handle transaction, uint32_t entry, uint32_t layer);
     bool    finish_rows(transaction_handle transaction, uint32_t entry, uint32_t new_valid);
     bool    set_logits(transaction_handle transaction, uint64_t position, const float * logits, uint32_t count);
     bool    fail(transaction_handle transaction);
@@ -54,6 +63,18 @@ class llama_slang_paged_requests {
     uint64_t                cursor(request_handle request) const;
     const float *           logits(request_handle request) const;
     bool                    logits_valid(request_handle request) const;
+    uint32_t                execution_count(transaction_handle transaction) const;
+    bool                    execution_compatible(transaction_handle transaction,
+                                                 uint32_t           n_layer,
+                                                 uint32_t           n_head_kv,
+                                                 uint32_t           head_dim) const;
+    bool          execution_entry_at(transaction_handle transaction, uint32_t index, execution_entry & result) const;
+    bool          layer_unwritten(transaction_handle transaction, uint32_t entry, uint32_t layer) const;
+    const float * readable_row(transaction_handle transaction,
+                               uint32_t           entry,
+                               bool               value,
+                               uint32_t           layer,
+                               uint32_t           row) const;
 
   private:
     struct staged_entry {
@@ -98,6 +119,8 @@ class llama_slang_paged_requests {
     float *                    published_logits_slice(size_t request_index);
     const float *              published_logits_slice(size_t request_index) const;
     float *                    staged_logits_slice(size_t request_index);
+    uint8_t *                  layer_progress_slice(size_t request_index, uint32_t entry);
+    const uint8_t *            layer_progress_slice(size_t request_index, uint32_t entry) const;
     bool                       fail_valid(transaction_record & transaction);
     void                       clear_transaction(size_t index);
     bool                       abort_record(size_t index);
@@ -110,4 +133,5 @@ class llama_slang_paged_requests {
     std::vector<staged_entry>               staged_;
     std::vector<float>                      published_logits_;
     std::vector<float>                      staged_logits_;
+    std::vector<uint8_t>                    layer_progress_;
 };
