@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-slang-paged-cache.h"
 
 #include <cassert>
 #include <cmath>
@@ -23,6 +24,43 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+namespace {
+
+void llama_slang_paged_attention_forward(ggml_tensor * dst, const ggml_tensor * q, const ggml_tensor * k,
+                                         const ggml_tensor * v, int ith, int nth, void * userdata) {
+    auto * state = static_cast<llm_graph_input_attn_slang_paged::callback_state *>(userdata);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    if (dst->data != nullptr) {
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    if (state == nullptr || state->mctx == nullptr || dst->data == nullptr || q->data == nullptr ||
+        k->data == nullptr || v->data == nullptr || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+        v->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || !ggml_is_contiguous(k) ||
+        !ggml_is_contiguous(v) || !ggml_is_contiguous(dst) || q->ne[2] <= 0 || uint64_t(q->ne[2]) > UINT32_MAX ||
+        q->ne[3] != 1 || k->ne[2] != q->ne[2] || v->ne[2] != q->ne[2]) {
+        if (state && state->mctx) {
+            state->mctx->latch_graph_failure();
+        }
+        return;
+    }
+    const uint32_t n_tokens = uint32_t(q->ne[2]);
+    const bool ok = state->mctx->attention().execute(state->mctx->requests(), state->mctx->transaction(), state->layer,
+                                                     state->mctx->positions(), n_tokens,
+                                                     { static_cast<const float *>(q->data), size_t(ggml_nelements(q)) },
+                                                     { static_cast<const float *>(k->data), size_t(ggml_nelements(k)) },
+                                                     { static_cast<const float *>(v->data), size_t(ggml_nelements(v)) },
+                                                     { static_cast<float *>(dst->data), size_t(ggml_nelements(dst)) },
+                                                     state->mctx->scratch(), state->mctx->scratch_elements());
+    if (!ok) {
+        state->mctx->latch_graph_failure();
+    }
+}
+
+}  // namespace
 
 // dedup helpers
 
@@ -2800,6 +2838,44 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    return cur;
+}
+
+llm_graph_input_attn_slang_paged * llm_graph_context::build_attn_inp_slang_paged() const {
+    auto * mctx_cur = dynamic_cast<llama_memory_slang_paged_context *>(const_cast<llama_memory_context_i *>(mctx));
+    GGML_ASSERT(mctx_cur != nullptr);
+    return (llm_graph_input_attn_slang_paged *) res->add_input(
+        std::make_unique<llm_graph_input_attn_slang_paged>(mctx_cur, hparams.n_layer()));
+}
+
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_attn_slang_paged * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        float kq_scale,
+        int il) const {
+    GGML_UNUSED(kq_scale);
+    q_cur = ggml_cont(ctx0, q_cur);
+    k_cur = ggml_cont(ctx0, k_cur);
+    v_cur = ggml_cont(ctx0, v_cur);
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+
+    ggml_tensor * cur =
+        ggml_map_custom3(ctx0, q_cur, k_cur, v_cur, llama_slang_paged_attention_forward, 1, &inp->states.at(il));
+    cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0] * q_cur->ne[1], q_cur->ne[2]);
+    cb(cur, "kqv_out", il);
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
     return cur;
 }
 

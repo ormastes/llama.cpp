@@ -4,6 +4,16 @@
 #include <cmath>
 #include <limits>
 
+// These CPU kernels are intentionally declared here instead of including the
+// private vec.h header.  vec.h also defines unrelated inline ggml helpers and
+// makes this isolated component depend on ggml-base implementation symbols.
+#if defined(LLAMA_SLANG_PAGED_CPU_DIRECT)
+extern "C" {
+void   ggml_vec_dot_f32(int n, float * s, size_t bs, const float * x, size_t bx, const float * y, size_t by, int nrc);
+double ggml_vec_soft_max_f32(int n, float * y, const float * x, float maximum);
+}
+#endif
+
 namespace {
 
 bool checked_mul(size_t left, size_t right, size_t & result) {
@@ -33,7 +43,9 @@ bool llama_slang_paged_attention::execute(llama_slang_paged_requests &          
                                           input                                          q,
                                           input                                          k,
                                           input                                          v,
-                                          output                                         result) const {
+                                          output                                         result,
+                                          float *                                        scratch,
+                                          size_t                                         scratch_elements) const {
     auto reject = [&]() {
         requests.fail(transaction);
         return false;
@@ -128,6 +140,85 @@ bool llama_slang_paged_attention::execute(llama_slang_paged_requests &          
             return reject();
         }
     }
+
+#if defined(LLAMA_SLANG_PAGED_CPU_DIRECT)
+    if (scratch != nullptr) {
+        const uint64_t last_position = uint64_t(positions[n_tokens - 1]);
+        const uint64_t padded_u64    = std::max<uint64_t>(256, (last_position + 256) & ~uint64_t(255));
+        if (padded_u64 > uint64_t(std::numeric_limits<int>::max()) || padded_u64 > size_t(-1) / 2 ||
+            scratch_elements < size_t(padded_u64) * 2) {
+            return reject();
+        }
+        const size_t padded   = size_t(padded_u64);
+        float *      scores   = scratch;
+        float *      values   = scratch + padded;
+        auto         page_row = [&](bool value, uint32_t layer_index, uint64_t position) -> const float * {
+            for (uint32_t entry_index = 0; entry_index < n_entries; ++entry_index) {
+                llama_slang_paged_requests::execution_entry entry{};
+                if (!requests.execution_entry_at(transaction, entry_index, entry)) {
+                    return nullptr;
+                }
+                if (position >= entry.position_base && position < entry.position_base + entry.readable_rows) {
+                    return requests.readable_row(transaction, entry_index, value, layer_index,
+                                                 uint32_t(position - entry.position_base));
+                }
+            }
+            if (position < uint64_t(positions[0]) || position > last_position) {
+                return nullptr;
+            }
+            const size_t token = size_t(position - uint64_t(positions[0]));
+            return (value ? v.data : k.data) + token * config_.n_head_kv * config_.head_dim;
+        };
+        const uint32_t group_size = config_.n_head_q / config_.n_head_kv;
+        for (uint32_t token = 0; token < n_tokens; ++token) {
+            const size_t n_keys = size_t(positions[token]) + 1;
+            for (uint32_t query_head = 0; query_head < config_.n_head_q; ++query_head) {
+                const uint32_t kv_head = query_head / group_size;
+                const float *  query   = q.data + (size_t(token) * config_.n_head_q + query_head) * config_.head_dim;
+                for (size_t position = 0; position < n_keys; ++position) {
+                    const float * key = page_row(false, layer, position);
+                    if (key == nullptr) {
+                        return reject();
+                    }
+                    ggml_vec_dot_f32(config_.head_dim, &scores[position], 0, query, 0,
+                                     key + size_t(kv_head) * config_.head_dim, 0, 1);
+                    scores[position] *= config_.scale;
+                }
+                std::fill(scores + n_keys, scores + padded, -std::numeric_limits<float>::infinity());
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (size_t position = 0; position < padded; ++position) {
+                    maximum = std::max(maximum, scores[position]);
+                }
+                const double sum = ggml_vec_soft_max_f32(int(padded), scores, scores, maximum);
+                if (!std::isfinite(sum) || sum <= 0.0) {
+                    return reject();
+                }
+                const float inverse_sum = float(1.0 / sum);
+                for (size_t position = 0; position < padded; ++position) {
+                    scores[position] *= inverse_sum;
+                }
+                float * destination = result.data + (size_t(token) * config_.n_head_q + query_head) * config_.head_dim;
+                for (uint32_t dim = 0; dim < config_.head_dim; ++dim) {
+                    for (size_t position = 0; position < n_keys; ++position) {
+                        const float * value = page_row(true, layer, position);
+                        if (value == nullptr) {
+                            return reject();
+                        }
+                        values[position] = value[size_t(kv_head) * config_.head_dim + dim];
+                    }
+                    std::fill(values + n_keys, values + padded, 0.0f);
+                    ggml_vec_dot_f32(int(padded), &destination[dim], 0, scores, 0, values, 0, 1);
+                }
+            }
+        }
+        return true;
+    }
+#else
+    (void) scratch_elements;
+    if (scratch != nullptr) {
+        return reject();
+    }
+#endif
 
     const uint32_t group_size = config_.n_head_q / config_.n_head_kv;
     for (uint32_t token = 0; token < n_tokens; ++token) {

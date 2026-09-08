@@ -46,6 +46,7 @@ class llama_slang_paged_requests {
 
     request_handle open_request(uint64_t execution_namespace);
     bool           close_request(request_handle request);
+    bool           discard_request(request_handle request);
     bool           cancel_request(request_handle request);
 
     transaction_handle begin(request_handle request, uint64_t table_base, uint32_t expected_pages);
@@ -55,8 +56,9 @@ class llama_slang_paged_requests {
     bool    finish_rows(transaction_handle transaction, uint32_t entry, uint32_t new_valid);
     bool    set_logits(transaction_handle transaction, uint64_t position, const float * logits, uint32_t count);
     bool    fail(transaction_handle transaction);
-    bool    commit(transaction_handle transaction);
+    bool    commit(transaction_handle transaction, bool release_replaced = false);
     bool    abort(transaction_handle transaction);
+    bool    discard(transaction_handle transaction);
 
     uint32_t                published_count(request_handle request) const;
     const published_entry * published_table(request_handle request) const;

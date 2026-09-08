@@ -38,7 +38,9 @@ class llama_slang_paged_attention {
                  input                                          q,
                  input                                          k,
                  input                                          v,
-                 output                                         result) const;
+                 output                                         result,
+                 float *                                        scratch          = nullptr,
+                 size_t                                         scratch_elements = 0) const;
 
   private:
     config config_;

@@ -221,6 +221,38 @@ bool llama_slang_paged_requests::close_request(request_handle request) {
     return true;
 }
 
+bool llama_slang_paged_requests::discard_request(request_handle request) {
+    request_record * record = find_request(request);
+    if (record == nullptr) {
+        return false;
+    }
+    size_t index = request_index(*record);
+    if (transactions_[index].active && !discard(transactions_[index].identity)) {
+        return false;
+    }
+    record = find_request(request);
+    if (record == nullptr) {
+        return false;
+    }
+    const published_entry * table = published_slice(index);
+    for (uint32_t i = 0; i < record->published_count; ++i) {
+        if (!pool_->unmap_for_request(table[i].page, request)) {
+            return false;
+        }
+        if (pool_->mapping_references(table[i].page) == 0 && pool_->read_borrows(table[i].page) == 0 &&
+            !pool_->release(table[i].page)) {
+            return false;
+        }
+    }
+    *record              = {};
+    transactions_[index] = {};
+    std::fill_n(published_slice(index), config_.max_pages_per_request, published_entry{});
+    std::fill_n(staged_slice(index), config_.max_pages_per_request, staged_entry{});
+    std::fill_n(published_logits_slice(index), config_.vocabulary_width, 0.0f);
+    std::fill_n(staged_logits_slice(index), config_.vocabulary_width, 0.0f);
+    return true;
+}
+
 bool llama_slang_paged_requests::cancel_request(request_handle request) {
     return close_request(request);
 }
@@ -415,7 +447,7 @@ bool llama_slang_paged_requests::fail(transaction_handle transaction) {
     return true;
 }
 
-bool llama_slang_paged_requests::commit(transaction_handle transaction) {
+bool llama_slang_paged_requests::commit(transaction_handle transaction, bool release_replaced) {
     transaction_record * record = find_transaction(transaction);
     if (record == nullptr) {
         return false;
@@ -510,8 +542,11 @@ bool llama_slang_paged_requests::commit(transaction_handle transaction) {
     }
 
     for (uint32_t i = 0; i < request->published_count; ++i) {
-        if (!appears_in_new(old_table[i].page) && !pool_->unmap_for_request(old_table[i].page, record->request)) {
-            std::abort();
+        if (!appears_in_new(old_table[i].page)) {
+            if (!pool_->unmap_for_request(old_table[i].page, record->request) ||
+                (release_replaced && !pool_->release(old_table[i].page))) {
+                std::abort();
+            }
         }
     }
     published_entry * new_table = published_slice(index);
@@ -560,6 +595,29 @@ bool llama_slang_paged_requests::abort(transaction_handle transaction) {
     }
     request_record * request = find_request(record->request);
     return request != nullptr && abort_record(request_index(*request));
+}
+
+bool llama_slang_paged_requests::discard(transaction_handle transaction) {
+    transaction_record * record = find_transaction(transaction);
+    if (record == nullptr) {
+        return false;
+    }
+    request_record * request = find_request(record->request);
+    if (request == nullptr) {
+        return false;
+    }
+    const size_t   index  = request_index(*request);
+    staged_entry * staged = staged_slice(index);
+    bool           ok     = true;
+    for (uint32_t i = 0; i < record->staged_count; ++i) {
+        if (staged[i].exclusive) {
+            ok = pool_->abort_exclusive(staged[i].page, record->identity) && pool_->release(staged[i].page) && ok;
+        } else {
+            ok = pool_->return_sealed(staged[i].page) && ok;
+        }
+    }
+    clear_transaction(index);
+    return ok;
 }
 
 uint32_t llama_slang_paged_requests::published_count(request_handle request) const {

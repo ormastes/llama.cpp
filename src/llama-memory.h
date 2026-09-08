@@ -64,6 +64,12 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Transactional memory implementations may defer publication until all
+    // graph work and output transfers are known to have completed.
+    virtual bool requires_finalize() const { return false; }
+    virtual bool finalize(const float *, uint32_t, llama_pos) { return true; }
+    virtual void abort() {}
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

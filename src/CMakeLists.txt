@@ -10,6 +10,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 add_library(llama
             ../include/llama.h
+            ../include/llama-slang-paged.h
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp
@@ -34,6 +35,7 @@ add_library(llama
             llama-memory-hybrid-idx.cpp
             llama-memory-recurrent.cpp
             llama-memory-slang-paged.cpp
+            llama-memory-slang-paged-cache.cpp
             llama-slang-paged-requests.cpp
             llama-slang-paged-attention.cpp
             llama-mmap.cpp
@@ -62,6 +64,10 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (NOT GGML_BACKEND_DL AND NOT (WIN32 AND BUILD_SHARED_LIBS))
+    target_compile_definitions(llama PRIVATE LLAMA_SLANG_PAGED_CPU_DIRECT)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
