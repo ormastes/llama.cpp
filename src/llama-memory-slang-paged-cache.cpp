@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -144,11 +145,50 @@ std::unique_ptr<llama_memory_slang_paged_cache> llama_memory_slang_paged_cache::
     const llama_memory_params &      memory,
     const llama_cparams &            cparams,
     const llama_slang_paged_params & paged) {
+    const int32_t vocabulary_width = model.vocab.n_tokens();
+    if (vocabulary_width <= 0 || size_t(vocabulary_width) > std::numeric_limits<size_t>::max() / sizeof(float) / 2) {
+        return nullptr;
+    }
+    return create_impl(model, memory, cparams, paged, 1, paged.page_capacity,
+                       paged.descriptor_byte_limit, size_t(vocabulary_width) * sizeof(float) * 2, false);
+}
+
+std::unique_ptr<llama_memory_slang_paged_cache> llama_memory_slang_paged_cache::create_external(
+        const llama_model & model,
+        const llama_memory_params & memory,
+        const llama_cparams & cparams,
+        const llama_slang_paged_provider_params & provider) {
+    if (provider.abi_version != LLAMA_SLANG_PAGED_PROVIDER_ABI_VERSION || provider.max_requests == 0 ||
+        provider.max_pages_per_request == 0 || provider.logits_byte_limit == 0) {
+        return nullptr;
+    }
+    const llama_slang_paged_params paged = {
+        provider.page_tokens, provider.page_capacity, provider.byte_limit, provider.descriptor_byte_limit,
+    };
+    return create_impl(model, memory, cparams, paged, provider.max_requests, provider.max_pages_per_request,
+                       provider.metadata_byte_limit, provider.logits_byte_limit, true);
+}
+
+std::unique_ptr<llama_memory_slang_paged_cache> llama_memory_slang_paged_cache::create_impl(
+    const llama_model &              model,
+    const llama_memory_params &      memory,
+    const llama_cparams &            cparams,
+    const llama_slang_paged_params & paged,
+    uint32_t                         max_requests,
+    uint32_t                         max_pages_per_request,
+    size_t                           metadata_byte_limit,
+    size_t                           logits_byte_limit,
+    bool                             external_mode) {
 #if !defined(LLAMA_SLANG_PAGED_CPU_DIRECT)
     GGML_UNUSED(model);
     GGML_UNUSED(memory);
     GGML_UNUSED(cparams);
     GGML_UNUSED(paged);
+    GGML_UNUSED(max_requests);
+    GGML_UNUSED(max_pages_per_request);
+    GGML_UNUSED(metadata_byte_limit);
+    GGML_UNUSED(logits_byte_limit);
+    GGML_UNUSED(external_mode);
     return nullptr;
 #else
     const auto & hp           = model.hparams;
@@ -177,11 +217,11 @@ std::unique_ptr<llama_memory_slang_paged_cache> llama_memory_slang_paged_cache::
     std::shared_ptr<llama_slang_paged_pool> pool(std::move(unique_pool));
     const uint32_t                          vocabulary_width = uint32_t(model.vocab.n_tokens());
     llama_slang_paged_requests::limits      limits           = {
-        1,
-        paged.page_capacity,
+        max_requests,
+        max_pages_per_request,
         vocabulary_width,
-        paged.descriptor_byte_limit,
-        size_t(vocabulary_width) * sizeof(float) * 2,
+        metadata_byte_limit,
+        logits_byte_limit,
     };
     auto                        requests = llama_slang_paged_requests::create(pool, limits);
     llama_slang_paged_attention attention({
@@ -195,8 +235,9 @@ std::unique_ptr<llama_memory_slang_paged_cache> llama_memory_slang_paged_cache::
         return nullptr;
     }
     auto result = std::unique_ptr<llama_memory_slang_paged_cache>(new llama_memory_slang_paged_cache(
-        std::move(pool), std::move(requests), attention, vocabulary_width, paged.page_tokens, execution_namespace));
-    return result->reset_request() ? std::move(result) : nullptr;
+        std::move(pool), std::move(requests), attention, vocabulary_width, paged.page_tokens, execution_namespace,
+        cparams.n_ctx, external_mode));
+    return external_mode || result->reset_request() ? std::move(result) : nullptr;
 #endif
 }
 
@@ -205,13 +246,17 @@ llama_memory_slang_paged_cache::llama_memory_slang_paged_cache(std::shared_ptr<l
                                                                llama_slang_paged_attention                 attention,
                                                                uint32_t vocabulary_width,
                                                                uint32_t page_tokens,
-                                                               uint64_t execution_namespace) :
+                                                               uint64_t execution_namespace,
+                                                               uint32_t max_context_tokens,
+                                                               bool external_mode) :
     pool_(std::move(pool)),
     requests_(std::move(requests)),
     attention_(attention),
     vocabulary_width_(vocabulary_width),
     page_tokens_(page_tokens),
-    execution_namespace_(execution_namespace) {}
+    execution_namespace_(execution_namespace),
+    max_context_tokens_(max_context_tokens),
+    external_mode_(external_mode) {}
 
 llama_memory_slang_paged_cache::~llama_memory_slang_paged_cache() {
     if (request_ != 0) {
@@ -230,8 +275,15 @@ bool llama_memory_slang_paged_cache::reset_request() {
 llama_memory_context_ptr llama_memory_slang_paged_cache::init_batch(llama_batch_allocr & balloc,
                                                                     uint32_t             n_ubatch,
                                                                     bool                 embd_all) {
-    if (failed_ || embd_all || balloc.get_n_tokens() == 0 || balloc.get_n_tokens() > n_ubatch) {
+    auto reject = [&]() {
+        if (external_mode_ && bound_transaction_ != 0) {
+            fail_external(bound_transaction_);
+        }
         return std::make_unique<llama_memory_slang_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    };
+    if (failed_ || embd_all || balloc.get_n_tokens() == 0 || balloc.get_n_tokens() > n_ubatch ||
+        (external_mode_ && bound_transaction_ == 0)) {
+        return reject();
     }
     balloc.split_reset();
     llama_ubatch ubatch  = balloc.split_simple(n_ubatch);
@@ -240,16 +292,35 @@ llama_memory_context_ptr llama_memory_slang_paged_cache::init_batch(llama_batch_
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         outputs += ubatch.output[i] != 0;
     }
-    const uint64_t cursor = requests_->cursor(request_);
+    const uint64_t active_request = external_mode_ ? requests_->transaction_request(bound_transaction_) : request_;
+    const uint64_t cursor = external_mode_ ? requests_->transaction_append_position(bound_transaction_) :
+                                             requests_->cursor(active_request);
+    const bool position_overflow = ubatch.n_tokens > std::numeric_limits<uint64_t>::max() - cursor;
     if (ubatch.n_tokens != balloc.get_n_tokens() || extra.n_tokens != 0 || ubatch.n_seqs_unq != 1 ||
         ubatch.seq_id_unq[0] != 0 || ubatch.n_pos != 1 || outputs != 1 || !ubatch.output[ubatch.n_tokens - 1] ||
+        cursor == std::numeric_limits<uint64_t>::max() || position_overflow ||
         ubatch.pos[0] < 0 || uint64_t(ubatch.pos[0]) != cursor) {
-        return std::make_unique<llama_memory_slang_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        return reject();
     }
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != 0 || ubatch.pos[i] < 0 ||
             uint64_t(ubatch.pos[i]) != cursor + i) {
-            return std::make_unique<llama_memory_slang_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            return reject();
+        }
+    }
+    if (external_mode_) {
+        const uint64_t end = requests_->transaction_end_position(bound_transaction_);
+        if (cursor == std::numeric_limits<uint64_t>::max() || end == std::numeric_limits<uint64_t>::max() ||
+            end != cursor + ubatch.n_tokens || end > max_context_tokens_) {
+            return reject();
+        }
+        try {
+            return std::make_unique<llama_memory_slang_paged_context>(
+                this, std::move(ubatch), bound_transaction_, false);
+        } catch (const std::bad_alloc &) {
+            return reject();
+        } catch (const std::length_error &) {
+            return reject();
         }
     }
     const uint64_t end = cursor + ubatch.n_tokens;
@@ -311,6 +382,10 @@ bool llama_memory_slang_paged_cache::get_can_shift() const {
 }
 
 void llama_memory_slang_paged_cache::clear(bool) {
+    if (external_mode_) {
+        unsupported("clear");
+        return;
+    }
     failed_ = !reset_request();
     if (failed_) {
         LLAMA_LOG_ERROR("%s: paged cache clear failed\n", __func__);
@@ -318,6 +393,9 @@ void llama_memory_slang_paged_cache::clear(bool) {
 }
 
 bool llama_memory_slang_paged_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (external_mode_) {
+        return false;
+    }
     return seq_id == 0 && p0 == 0 && p1 == -1 && reset_request();
 }
 
@@ -381,6 +459,133 @@ llama_slang_paged_attention & llama_memory_slang_paged_cache::attention() {
     return attention_;
 }
 
+bool llama_memory_slang_paged_cache::external_mode() const {
+    return external_mode_;
+}
+
+int64_t llama_memory_slang_paged_cache::request_open() {
+    if (!external_mode_) {
+        return -1;
+    }
+    const uint64_t request = requests_->open_request(execution_namespace_);
+    return request == 0 || request > uint64_t(INT64_MAX) ? -1 : int64_t(request);
+}
+
+bool llama_memory_slang_paged_cache::request_close(uint64_t request) {
+    if (!external_mode_ || request == 0 || bound_transaction_ != 0) {
+        return false;
+    }
+    if (computed_transaction_ != 0 && requests_->transaction_request(computed_transaction_) == request) {
+        if (!requests_->abort(computed_transaction_)) {
+            return false;
+        }
+        computed_transaction_ = 0;
+    }
+    return requests_->close_request(request);
+}
+
+int64_t llama_memory_slang_paged_cache::page_reserve() {
+    if (!external_mode_) {
+        return -1;
+    }
+    const uint64_t page = pool_->reserve();
+    return page == 0 || page > uint64_t(INT64_MAX) ? -1 : int64_t(page);
+}
+
+bool llama_memory_slang_paged_cache::page_release(uint64_t page) {
+    return external_mode_ && page != 0 && pool_->release(page);
+}
+
+bool llama_memory_slang_paged_cache::page_copy_tail(uint64_t source, uint64_t destination, uint32_t rows) {
+    return external_mode_ && source != 0 && destination != 0 && pool_->copy_rows(source, destination, rows);
+}
+
+int64_t llama_memory_slang_paged_cache::table_begin(
+        uint64_t request, uint64_t base_position, uint32_t expected_pages) {
+    if (!external_mode_ || request == 0 || bound_transaction_ != 0 || computed_transaction_ != 0) {
+        return -1;
+    }
+    const uint64_t transaction = requests_->begin(request, base_position, expected_pages);
+    return transaction == 0 || transaction > uint64_t(INT64_MAX) ? -1 : int64_t(transaction);
+}
+
+bool llama_memory_slang_paged_cache::table_push(
+        uint64_t transaction, uint64_t page, uint32_t valid_rows, uint32_t additional_rows) {
+    if (!external_mode_ || transaction == 0 || bound_transaction_ != 0 || computed_transaction_ != 0) {
+        return false;
+    }
+    if (page == 0 || !requests_->push(transaction, page, valid_rows, additional_rows)) {
+        fail_external(transaction);
+        return false;
+    }
+    return true;
+}
+
+bool llama_memory_slang_paged_cache::bind_transaction(uint64_t transaction) {
+    if (!external_mode_ || transaction == 0 || bound_transaction_ != 0 || computed_transaction_ != 0 ||
+        requests_->transaction_request(transaction) == 0 || requests_->transaction_failed(transaction)) {
+        return false;
+    }
+    bound_transaction_ = transaction;
+    return true;
+}
+
+void llama_memory_slang_paged_cache::unbind_transaction(uint64_t transaction) {
+    if (bound_transaction_ == transaction) {
+        bound_transaction_ = 0;
+    }
+}
+
+bool llama_memory_slang_paged_cache::fail_external(uint64_t transaction) {
+    if (!external_mode_ || transaction == 0 || requests_->transaction_request(transaction) == 0) {
+        return false;
+    }
+    return requests_->transaction_failed(transaction) || requests_->fail(transaction);
+}
+
+bool llama_memory_slang_paged_cache::commit_external(uint64_t transaction) {
+    if (!external_mode_ || bound_transaction_ != 0 || transaction == 0 ||
+        requests_->transaction_request(transaction) == 0) {
+        return false;
+    }
+    const bool computed = computed_transaction_ == transaction && !requests_->transaction_failed(transaction);
+    bool       ok       = false;
+    if (computed) {
+        ok = requests_->commit(transaction, false);
+    } else {
+        fail_external(transaction);
+        requests_->abort(transaction);
+    }
+    if (computed_transaction_ == transaction) {
+        computed_transaction_ = 0;
+    }
+    return ok;
+}
+
+bool llama_memory_slang_paged_cache::abort_external(uint64_t transaction) {
+    if (!external_mode_ || transaction == 0 || bound_transaction_ == transaction) {
+        return false;
+    }
+    const bool ok = requests_->abort(transaction);
+    if (computed_transaction_ == transaction) {
+        computed_transaction_ = 0;
+    }
+    return ok;
+}
+
+bool llama_memory_slang_paged_cache::logits_copy(uint64_t request, float * destination, size_t count) const {
+    if (!external_mode_ || request == 0 || destination == nullptr || count != vocabulary_width_ ||
+        !requests_->logits_valid(request)) {
+        return false;
+    }
+    const float * logits = requests_->logits(request);
+    if (logits == nullptr) {
+        return false;
+    }
+    std::memcpy(destination, logits, count * sizeof(float));
+    return true;
+}
+
 bool llama_memory_slang_paged_cache::finish(llama_slang_paged_requests::transaction_handle transaction,
                                             const float *                                  logits,
                                             uint32_t                                       count,
@@ -390,18 +595,30 @@ bool llama_memory_slang_paged_cache::finish(llama_slang_paged_requests::transact
         llama_slang_paged_requests::execution_entry entry{};
         if (!requests_->execution_entry_at(transaction, i, entry) ||
             (entry.writable_end > entry.readable_rows && !requests_->finish_rows(transaction, i, entry.writable_end))) {
-            requests_->discard(transaction);
+            if (external_mode_) {
+                fail_external(transaction);
+            } else {
+                requests_->discard(transaction);
+            }
             return false;
         }
     }
-    return logits != nullptr && count == vocabulary_width_ && position >= 0 &&
-           requests_->set_logits(transaction, uint64_t(position), logits, count) &&
-           requests_->commit(transaction, true);
+    if (logits == nullptr || count != vocabulary_width_ || position < 0 ||
+        !requests_->set_logits(transaction, uint64_t(position), logits, count)) {
+        return false;
+    }
+    if (external_mode_) {
+        computed_transaction_ = transaction;
+        return true;
+    }
+    return requests_->commit(transaction, true);
 }
 
 void llama_memory_slang_paged_cache::abort(llama_slang_paged_requests::transaction_handle transaction) {
     if (transaction != 0) {
         requests_->fail(transaction);
-        requests_->discard(transaction);
+        if (!external_mode_) {
+            requests_->discard(transaction);
+        }
     }
 }

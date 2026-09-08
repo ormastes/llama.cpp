@@ -65,6 +65,10 @@ class llama_slang_paged_requests {
     uint64_t                cursor(request_handle request) const;
     const float *           logits(request_handle request) const;
     bool                    logits_valid(request_handle request) const;
+    request_handle          transaction_request(transaction_handle transaction) const;
+    bool                    transaction_failed(transaction_handle transaction) const;
+    uint64_t                transaction_append_position(transaction_handle transaction) const;
+    uint64_t                transaction_end_position(transaction_handle transaction) const;
     uint32_t                execution_count(transaction_handle transaction) const;
     bool                    execution_compatible(transaction_handle transaction,
                                                  uint32_t           n_layer,
@@ -118,6 +122,7 @@ class llama_slang_paged_requests {
     published_entry *          published_slice(size_t request_index);
     const published_entry *    published_slice(size_t request_index) const;
     staged_entry *             staged_slice(size_t request_index);
+    const staged_entry *       staged_slice(size_t request_index) const;
     float *                    published_logits_slice(size_t request_index);
     const float *              published_logits_slice(size_t request_index) const;
     float *                    staged_logits_slice(size_t request_index);

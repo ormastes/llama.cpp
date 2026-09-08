@@ -12,8 +12,9 @@ namespace {
 std::atomic<uint64_t> g_next_page_identity{ 1 };
 
 uint64_t next_page_identity() {
+    constexpr uint64_t limit = uint64_t(std::numeric_limits<int64_t>::max());
     uint64_t current = g_next_page_identity.load(std::memory_order_relaxed);
-    while (current != std::numeric_limits<uint64_t>::max()) {
+    while (current <= limit) {
         if (g_next_page_identity.compare_exchange_weak(current, current + 1, std::memory_order_relaxed,
                                                        std::memory_order_relaxed)) {
             return current;
