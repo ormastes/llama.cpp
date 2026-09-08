@@ -34,6 +34,7 @@ add_library(llama
             llama-memory-hybrid-idx.cpp
             llama-memory-recurrent.cpp
             llama-memory-slang-paged.cpp
+            llama-slang-paged-requests.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
