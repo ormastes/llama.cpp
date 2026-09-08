@@ -308,6 +308,14 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+add_executable(test-slang-paged-kv-pool
+    test-slang-paged-kv-pool.cpp
+    ../src/llama-memory-slang-paged.cpp)
+target_include_directories(test-slang-paged-kv-pool PRIVATE ../src)
+target_compile_features(test-slang-paged-kv-pool PRIVATE cxx_std_17)
+target_compile_definitions(test-slang-paged-kv-pool PRIVATE LLAMA_SLANG_PAGED_TESTING)
+llama_test(test-slang-paged-kv-pool)
+
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473
 if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
