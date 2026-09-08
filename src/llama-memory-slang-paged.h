@@ -40,11 +40,29 @@ class llama_slang_paged_pool {
     bool        seal(page_handle handle);
     bool        copy_rows(page_handle source, page_handle destination, uint32_t rows);
 
-    float *       writable_row(page_handle handle, bool value, uint32_t layer, uint32_t row);
+    // The future request registry owns exact sealed-page membership; this pool
+    // enforces aggregate references and names the sole writable-page owner.
+    bool map_for_request(page_handle handle, uint64_t request);
+    bool unmap_for_request(page_handle handle, uint64_t request);
+    bool borrow_sealed(page_handle handle);
+    bool return_sealed(page_handle handle);
+    // Exclusive staging is accepted only on an unpublished writable page.
+    // Published pages require a distinct copy-on-write destination.
+    bool claim_exclusive(page_handle handle, uint64_t transaction, uint64_t request);
+    bool abort_exclusive(page_handle handle, uint64_t transaction);
+    bool publish_exclusive(page_handle handle, uint64_t transaction, uint64_t request);
+    bool set_occupied_exclusive(page_handle handle, uint64_t transaction, uint32_t rows);
+    bool seal_exclusive(page_handle handle, uint64_t transaction);
+
+    float * writable_row(page_handle handle, bool value, uint32_t layer, uint32_t row);
+    float * writable_row_exclusive(page_handle handle, uint64_t transaction, bool value, uint32_t layer, uint32_t row);
     const float * row(page_handle handle, bool value, uint32_t layer, uint32_t row) const;
 
     page_state     state(page_handle handle) const;
     uint32_t       occupied(page_handle handle) const;
+    uint32_t       mapping_references(page_handle handle) const;
+    uint32_t       read_borrows(page_handle handle) const;
+    uint64_t       exclusive_transaction(page_handle handle) const;
     size_t         page_bytes() const;
     size_t         allocated_bytes() const;
     const layout & config() const;
@@ -56,10 +74,16 @@ class llama_slang_paged_pool {
 
   private:
     struct page {
-        float *     data     = nullptr;
-        page_handle identity = 0;
-        uint32_t    occupied = 0;
-        page_state  state    = page_state::free;
+        float *     data                       = nullptr;
+        page_handle identity                   = 0;
+        uint32_t    occupied                   = 0;
+        uint32_t    mapping_references         = 0;
+        uint32_t    read_borrows               = 0;
+        uint64_t    writable_owner             = 0;
+        uint64_t    exclusive_transaction      = 0;
+        uint64_t    exclusive_request          = 0;
+        uint32_t    exclusive_initial_occupied = 0;
+        page_state  state                      = page_state::free;
     };
 
     explicit llama_slang_paged_pool(const layout & config, size_t page_bytes);
