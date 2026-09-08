@@ -94,6 +94,382 @@ void compare_logits(llama_context * legacy,
     }
 }
 
+void compare_logits_copy(llama_context *              legacy,
+                         const std::vector<float> &    actual,
+                         int32_t                       n_vocab,
+                         const char *                  stage) {
+    const float * expected = llama_get_logits_ith(legacy, -1);
+    if (!expected || actual.size() != size_t(n_vocab)) {
+        fail("external logits missing");
+    }
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        if (!std::isfinite(expected[i]) || expected[i] != actual[i]) {
+            std::fprintf(stderr, "%s: logit %d differs: %.9g != %.9g\n", stage, i, expected[i], actual[i]);
+            fail("external logit parity");
+        }
+    }
+}
+
+bool decode_external(llama_context * ctx,
+                     int64_t         transaction,
+                     const std::vector<llama_token> & tokens,
+                     llama_pos       start) {
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    batch.n_tokens    = tokens.size();
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = start + i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = i + 1 == batch.n_tokens;
+    }
+    const bool ok = llama_slang_paged_decode(ctx, transaction, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+int64_t reserve_page(llama_context * ctx) {
+    const int64_t result = llama_slang_paged_page_reserve(ctx);
+    if (result <= 0) {
+        fail("external page reserve");
+    }
+    return result;
+}
+
+int64_t begin_table(llama_context * ctx, int64_t request, uint32_t pages) {
+    const int64_t result = llama_slang_paged_table_begin(ctx, request, 0, pages);
+    if (result <= 0) {
+        fail("external table begin");
+    }
+    return result;
+}
+
+void push_page(llama_context * ctx,
+               int64_t         transaction,
+               int64_t         page,
+               uint32_t        valid_rows,
+               uint32_t        additional_rows) {
+    if (llama_slang_paged_table_push(ctx, transaction, page, valid_rows, additional_rows) != 0) {
+        fail("external table push");
+    }
+}
+
+void copy_committed_logits(llama_context * ctx,
+                           int64_t         request,
+                           std::vector<float> & destination) {
+    if (llama_slang_paged_logits_copy(ctx, request, destination.data(), destination.size()) != 0) {
+        fail("external committed logits copy");
+    }
+}
+
+void run_external_provider_case(llama_model *                model,
+                                llama_context_params         cparams,
+                                const std::vector<llama_token> & prompt,
+                                int32_t                      n_vocab) {
+    if (prompt.size() < 7) {
+        fail("external prompt too short");
+    }
+
+    abort_control abort_state;
+    cparams.abort_callback      = abort_after_progress;
+    cparams.abort_callback_data = &abort_state;
+    llama_slang_paged_provider_params provider = {
+        LLAMA_SLANG_PAGED_PROVIDER_ABI_VERSION,
+        4,
+        8,
+        2,
+        4,
+        64u * 1024u * 1024u,
+        1024u * 1024u,
+        1024u * 1024u,
+        size_t(n_vocab) * sizeof(float) * 2 * 2,
+    };
+    llama_context * external = llama_init_from_model_slang_paged_external(model, cparams, provider);
+    llama_context * legacy_a = llama_init_from_model(model, cparams);
+    llama_context * legacy_b = llama_init_from_model(model, cparams);
+    if (!external || !legacy_a || !legacy_b) {
+        fail("external context creation");
+    }
+
+    llama_context * foreign_context = llama_init_from_model_slang_paged_external(model, cparams, provider);
+    const int64_t   foreign_request = foreign_context ? llama_slang_paged_request_open(foreign_context) : -1;
+    if (!foreign_context || foreign_request <= 0 ||
+        llama_slang_paged_table_begin(external, foreign_request, 0, 1) >= 0) {
+        fail("foreign request handle accepted");
+    }
+    if (llama_slang_paged_request_close(foreign_context, foreign_request) != 0) {
+        fail("foreign request cleanup");
+    }
+    llama_free(foreign_context);
+
+    std::vector<llama_token> one = { prompt.front() };
+    if (decode_tokens(external, one, 0)) {
+        fail("direct decode accepted by external context");
+    }
+
+    const int64_t request_a = llama_slang_paged_request_open(external);
+    const int64_t request_b = llama_slang_paged_request_open(external);
+    if (request_a <= 0 || request_b <= 0 || llama_slang_paged_request_open(external) >= 0) {
+        fail("external request admission");
+    }
+
+    int64_t transaction = begin_table(external, request_a, 1);
+    if (llama_slang_paged_table_push(external, transaction, 0, 0, 1) == 0 ||
+        llama_slang_paged_commit(external, transaction) == 0) {
+        fail("invalid page did not poison transaction");
+    }
+
+    int64_t malformed_page = reserve_page(external);
+    transaction            = begin_table(external, request_a, 1);
+    push_page(external, transaction, malformed_page, 0, 1);
+    llama_batch malformed{};
+    malformed.n_tokens = 1;
+    if (llama_slang_paged_decode(external, transaction, malformed) >= 0 ||
+        llama_slang_paged_commit(external, transaction) == 0 ||
+        llama_slang_paged_page_release(external, malformed_page) != 0) {
+        fail("malformed batch did not fail safely");
+    }
+
+    int64_t oversized_page = reserve_page(external);
+    transaction            = begin_table(external, request_a, 1);
+    push_page(external, transaction, oversized_page, 0, 1);
+    llama_token   oversized_token  = one.front();
+    llama_pos     oversized_pos    = 0;
+    int32_t       oversized_n_seq  = 1;
+    llama_seq_id  oversized_seq    = 0;
+    llama_seq_id * oversized_seqs  = &oversized_seq;
+    int8_t        oversized_logits = 1;
+    llama_batch oversized{};
+    oversized.n_tokens = int32_t(cparams.n_batch + 1);
+    oversized.token    = &oversized_token;
+    oversized.pos      = &oversized_pos;
+    oversized.n_seq_id = &oversized_n_seq;
+    oversized.seq_id   = &oversized_seqs;
+    oversized.logits   = &oversized_logits;
+    if (llama_slang_paged_decode(external, transaction, oversized) >= 0 ||
+        llama_slang_paged_commit(external, transaction) == 0 ||
+        llama_slang_paged_page_release(external, oversized_page) != 0) {
+        fail("oversized batch did not fail safely");
+    }
+
+    int64_t duplicate_page = reserve_page(external);
+    transaction            = begin_table(external, request_a, 1);
+    push_page(external, transaction, duplicate_page, 0, 1);
+    if (!decode_external(external, transaction, one, 0) ||
+        decode_external(external, transaction, one, 0) ||
+        llama_slang_paged_commit(external, transaction) == 0 ||
+        llama_slang_paged_page_release(external, duplicate_page) != 0) {
+        fail("duplicate decode did not poison transaction");
+    }
+
+    std::vector<llama_token> a_prefix(prompt.begin(), prompt.begin() + 5);
+    if (!decode_tokens(legacy_a, a_prefix, 0)) {
+        fail("external A reference prefix");
+    }
+    const int64_t shared_page = reserve_page(external);
+    int64_t       a_tail      = reserve_page(external);
+    transaction = begin_table(external, request_a, 2);
+    push_page(external, transaction, shared_page, 0, 4);
+    push_page(external, transaction, a_tail, 0, 1);
+    if (llama_slang_paged_commit(external, transaction) == 0) {
+        fail("premature external commit accepted");
+    }
+    transaction = begin_table(external, request_a, 2);
+    push_page(external, transaction, shared_page, 0, 4);
+    push_page(external, transaction, a_tail, 0, 1);
+    std::vector<float> copied_logits(n_vocab);
+    if (llama_slang_paged_logits_copy(external, request_a, copied_logits.data(), copied_logits.size()) == 0) {
+        fail("uncommitted logits exposed before decode");
+    }
+    if (!decode_external(external, transaction, a_prefix, 0)) {
+        fail("external A prefix decode");
+    }
+    if (llama_get_logits(external) != nullptr || llama_get_logits_ith(external, -1) != nullptr) {
+        fail("ambient external logits exposed");
+    }
+    if (llama_slang_paged_logits_copy(external, request_a, copied_logits.data(), copied_logits.size()) == 0) {
+        fail("computed logits exposed before commit");
+    }
+    if (llama_slang_paged_commit(external, transaction) != 0) {
+        fail("external A prefix commit");
+    }
+    copy_committed_logits(external, request_a, copied_logits);
+    compare_logits_copy(legacy_a, copied_logits, n_vocab, "A prefix");
+    if (llama_get_logits(external) != nullptr || llama_get_logits_ith(external, -1) != nullptr) {
+        fail("ambient committed external logits exposed");
+    }
+
+    std::vector<llama_token> b_full(prompt.begin(), prompt.begin() + 6);
+    std::vector<llama_token> b_suffix(prompt.begin() + 4, prompt.begin() + 6);
+    if (!decode_tokens(legacy_b, b_full, 0)) {
+        fail("external B reference");
+    }
+    int64_t b_tail = reserve_page(external);
+    transaction    = begin_table(external, request_b, 2);
+    push_page(external, transaction, shared_page, 4, 0);
+    push_page(external, transaction, b_tail, 0, 2);
+    if (!decode_external(external, transaction, b_suffix, 4) ||
+        llama_slang_paged_commit(external, transaction) != 0) {
+        fail("external B shared-prefix decode");
+    }
+    copy_committed_logits(external, request_b, copied_logits);
+    compare_logits_copy(legacy_b, copied_logits, n_vocab, "B shared prefix");
+
+    std::vector<llama_token> a_next = { prompt[5] };
+    if (!decode_tokens(legacy_a, a_next, 5)) {
+        fail("external A reference extension");
+    }
+    const int64_t old_a_tail   = a_tail;
+    int64_t       a_replacement = reserve_page(external);
+    if (llama_slang_paged_page_copy_tail(external, a_tail, a_replacement, 1) != 0) {
+        fail("external A tail copy");
+    }
+    const int64_t borrowed_partial = begin_table(external, request_b, 2);
+    push_page(external, borrowed_partial, shared_page, 4, 0);
+    push_page(external, borrowed_partial, old_a_tail, 1, 0);
+
+    transaction = begin_table(external, request_a, 2);
+    push_page(external, transaction, shared_page, 4, 0);
+    push_page(external, transaction, a_replacement, 1, 1);
+    if (!decode_external(external, transaction, a_next, 5) ||
+        llama_slang_paged_commit(external, transaction) != 0) {
+        fail("external A interleaved extension");
+    }
+    a_tail = a_replacement;
+    if (llama_slang_paged_page_release(external, old_a_tail) == 0 ||
+        llama_slang_paged_abort(external, borrowed_partial) != 0 ||
+        llama_slang_paged_page_release(external, old_a_tail) != 0) {
+        fail("external shared partial-tail ownership");
+    }
+    copy_committed_logits(external, request_b, copied_logits);
+    compare_logits_copy(legacy_b, copied_logits, n_vocab, "B retained during A tail replacement");
+    copy_committed_logits(external, request_a, copied_logits);
+    compare_logits_copy(legacy_a, copied_logits, n_vocab, "A interleaved");
+
+    std::vector<llama_token> b_next = { prompt[6] };
+    if (!decode_tokens(legacy_b, b_next, 6)) {
+        fail("external B reference extension");
+    }
+    const int64_t old_b_tail   = b_tail;
+    int64_t       b_replacement = reserve_page(external);
+    if (llama_slang_paged_page_copy_tail(external, b_tail, b_replacement, 2) != 0) {
+        fail("external B tail copy");
+    }
+    transaction = begin_table(external, request_b, 2);
+    push_page(external, transaction, shared_page, 4, 0);
+    push_page(external, transaction, b_replacement, 2, 1);
+    if (!decode_external(external, transaction, b_next, 6) ||
+        llama_slang_paged_commit(external, transaction) != 0) {
+        fail("external B interleaved extension");
+    }
+    b_tail = b_replacement;
+    if (llama_slang_paged_page_release(external, old_b_tail) != 0) {
+        fail("external replaced B page retained ownership");
+    }
+    copy_committed_logits(external, request_b, copied_logits);
+    compare_logits_copy(legacy_b, copied_logits, n_vocab, "B interleaved");
+
+    std::vector<llama_token> a_retry = { prompt[6] };
+    if (!decode_tokens(legacy_a, a_retry, 6)) {
+        fail("external abort reference");
+    }
+    int64_t aborted_tail = reserve_page(external);
+    if (llama_slang_paged_page_copy_tail(external, a_tail, aborted_tail, 2) != 0) {
+        fail("external abort tail copy");
+    }
+    transaction = begin_table(external, request_a, 2);
+    push_page(external, transaction, shared_page, 4, 0);
+    push_page(external, transaction, aborted_tail, 2, 1);
+    abort_state.enabled     = true;
+    abort_state.abort_after = 2;
+    if (decode_external(external, transaction, a_retry, 6)) {
+        fail("external graph abort accepted");
+    }
+    abort_state.enabled = false;
+    if (llama_slang_paged_abort(external, transaction) != 0) {
+        fail("external explicit abort");
+    }
+    if (llama_get_logits(external) != nullptr || llama_get_logits_ith(external, -1) != nullptr ||
+        llama_slang_paged_page_release(external, aborted_tail) != 0) {
+        fail("external abort visibility or ownership");
+    }
+
+    int64_t retry_tail = reserve_page(external);
+    if (llama_slang_paged_page_copy_tail(external, a_tail, retry_tail, 2) != 0) {
+        fail("external retry tail copy");
+    }
+    transaction = begin_table(external, request_a, 2);
+    push_page(external, transaction, shared_page, 4, 0);
+    push_page(external, transaction, retry_tail, 2, 1);
+    if (!decode_external(external, transaction, a_retry, 6) ||
+        llama_slang_paged_commit(external, transaction) != 0) {
+        fail("external retry decode");
+    }
+    if (llama_slang_paged_page_release(external, a_tail) != 0) {
+        fail("external replaced retry source retained ownership");
+    }
+    a_tail = retry_tail;
+    copy_committed_logits(external, request_a, copied_logits);
+    compare_logits_copy(legacy_a, copied_logits, n_vocab, "A abort retry");
+
+    if (llama_slang_paged_request_close(external, request_a) != 0 ||
+        llama_slang_paged_request_close(external, request_b) != 0 ||
+        llama_slang_paged_request_close(external, request_a) == 0) {
+        fail("external request close");
+    }
+    // Request close removes table mappings; the external owner deliberately
+    // retains sealed pages until it releases their opaque handles.
+    if (llama_slang_paged_page_release(external, shared_page) != 0 ||
+        llama_slang_paged_page_release(external, a_tail) != 0 ||
+        llama_slang_paged_page_release(external, b_tail) != 0) {
+        fail("external retained page release");
+    }
+
+    const int64_t close_request = llama_slang_paged_request_open(external);
+    const int64_t close_page    = reserve_page(external);
+    transaction                 = begin_table(external, close_request, 1);
+    push_page(external, transaction, close_page, 0, 1);
+    if (!decode_external(external, transaction, one, 0) ||
+        llama_slang_paged_request_close(external, close_request) != 0 ||
+        llama_slang_paged_commit(external, transaction) == 0 ||
+        llama_slang_paged_page_release(external, close_page) != 0) {
+        fail("computed request close");
+    }
+
+    const int64_t bounded_request = llama_slang_paged_request_open(external);
+    const int64_t bounded_page    = reserve_page(external);
+    transaction = llama_slang_paged_table_begin(external, bounded_request, int64_t(1) << 30, 1);
+    push_page(external, transaction, bounded_page, 0, 1);
+    if (decode_external(external, transaction, one, llama_pos(1) << 30) ||
+        llama_slang_paged_abort(external, transaction) != 0 ||
+        llama_slang_paged_request_close(external, bounded_request) != 0 ||
+        llama_slang_paged_page_release(external, bounded_page) != 0) {
+        fail("external absolute-position bound");
+    }
+    std::vector<int64_t> reserved;
+    for (;;) {
+        const int64_t page = llama_slang_paged_page_reserve(external);
+        if (page < 0) {
+            break;
+        }
+        reserved.push_back(page);
+    }
+    if (reserved.size() != provider.page_capacity) {
+        std::fprintf(stderr, "external page reclamation: reserved %zu of %u\n", reserved.size(),
+                     provider.page_capacity);
+        fail("external page reclamation");
+    }
+    for (int64_t page : reserved) {
+        if (llama_slang_paged_page_release(external, page) != 0) {
+            fail("external page release");
+        }
+    }
+
+    llama_free(legacy_b);
+    llama_free(legacy_a);
+    llama_free(external);
+}
+
 std::vector<llama_token> run_parity_case(llama_model *                    model,
                                          const llama_context_params &     cparams,
                                          const llama_slang_paged_params & paged_params,
@@ -164,6 +540,8 @@ int main(int argc, char ** argv) {
                                                   "Once upon a time, a small fox found a bright blue stone.", 20);
     run_parity_case(model, cparams, paged_params, vocab, n_vocab,
                     "At midnight, the observatory recorded a quiet signal beyond the winter stars.", 40);
+
+    run_external_provider_case(model, cparams, prompt, n_vocab);
 
     llama_slang_paged_params limited_params = { 4, 1, 4u * 1024u * 1024u, 1024u * 1024u };
     llama_context *          limited        = llama_init_from_model_slang_paged(model, cparams, limited_params);

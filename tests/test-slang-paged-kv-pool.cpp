@@ -159,11 +159,11 @@ int main() {
     invalid.descriptor_byte_limit = 1;
     REQUIRE(llama_slang_paged_pool::create(invalid) == nullptr);
 
-    llama_slang_paged_pool::test_set_next_identity(UINT64_MAX - 1);
+    llama_slang_paged_pool::test_set_next_identity(uint64_t(INT64_MAX));
     auto exhausted_pool = llama_slang_paged_pool::create(layout);
     REQUIRE(exhausted_pool != nullptr);
     const auto final_identity = exhausted_pool->reserve();
-    REQUIRE(final_identity == UINT64_MAX - 1);
+    REQUIRE(final_identity == uint64_t(INT64_MAX));
     REQUIRE(exhausted_pool->reserve() == 0);
     REQUIRE(exhausted_pool->release(final_identity));
     REQUIRE(exhausted_pool->reserve() == 0);

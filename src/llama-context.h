@@ -16,6 +16,8 @@
 
 struct llama_model;
 struct llama_slang_paged_params;
+struct llama_slang_paged_provider_params;
+class llama_memory_slang_paged_cache;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -45,7 +47,8 @@ struct llama_context {
     llama_context(
             const llama_model & model,
                   llama_context_params params,
-            const llama_slang_paged_params * paged = nullptr);
+            const llama_slang_paged_params * paged = nullptr,
+            const llama_slang_paged_provider_params * provider = nullptr);
 
     ~llama_context();
 
@@ -75,6 +78,7 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
     bool uses_slang_paged_memory() const;
+    llama_memory_slang_paged_cache * slang_paged_cache() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);

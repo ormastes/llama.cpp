@@ -58,6 +58,11 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
                                                                   const llama_memory_params &      memory,
                                                                   const llama_cparams &            cparams,
                                                                   const llama_slang_paged_params & paged);
+    static std::unique_ptr<llama_memory_slang_paged_cache> create_external(
+        const llama_model & model,
+        const llama_memory_params & memory,
+        const llama_cparams & cparams,
+        const llama_slang_paged_provider_params & provider);
 
     ~llama_memory_slang_paged_cache() override;
 
@@ -79,6 +84,20 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
 
     llama_slang_paged_requests &  requests();
     llama_slang_paged_attention & attention();
+    bool external_mode() const;
+    int64_t request_open();
+    bool request_close(uint64_t request);
+    int64_t page_reserve();
+    bool page_release(uint64_t page);
+    bool page_copy_tail(uint64_t source, uint64_t destination, uint32_t rows);
+    int64_t table_begin(uint64_t request, uint64_t base_position, uint32_t expected_pages);
+    bool table_push(uint64_t transaction, uint64_t page, uint32_t valid_rows, uint32_t additional_rows);
+    bool bind_transaction(uint64_t transaction);
+    void unbind_transaction(uint64_t transaction);
+    bool fail_external(uint64_t transaction);
+    bool commit_external(uint64_t transaction);
+    bool abort_external(uint64_t transaction);
+    bool logits_copy(uint64_t request, float * destination, size_t count) const;
     bool                          finish(llama_slang_paged_requests::transaction_handle transaction,
                                          const float *                                  logits,
                                          uint32_t                                       count,
@@ -86,12 +105,24 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
     void                          abort(llama_slang_paged_requests::transaction_handle transaction);
 
   private:
+    static std::unique_ptr<llama_memory_slang_paged_cache> create_impl(
+        const llama_model & model,
+        const llama_memory_params & memory,
+        const llama_cparams & cparams,
+        const llama_slang_paged_params & paged,
+        uint32_t max_requests,
+        uint32_t max_pages_per_request,
+        size_t metadata_byte_limit,
+        size_t logits_byte_limit,
+        bool external_mode);
     llama_memory_slang_paged_cache(std::shared_ptr<llama_slang_paged_pool>     pool,
                                    std::unique_ptr<llama_slang_paged_requests> requests,
                                    llama_slang_paged_attention                 attention,
                                    uint32_t                                    vocabulary_width,
                                    uint32_t                                    page_tokens,
-                                   uint64_t                                    execution_namespace);
+                                   uint64_t                                    execution_namespace,
+                                   uint32_t                                    max_context_tokens,
+                                   bool                                        external_mode);
     bool reset_request();
     void unsupported(const char * operation) const;
 
@@ -102,5 +133,9 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
     uint32_t                                    vocabulary_width_    = 0;
     uint32_t                                    page_tokens_         = 0;
     uint64_t                                    execution_namespace_ = 0;
+    uint32_t                                    max_context_tokens_  = 0;
+    uint64_t                                    bound_transaction_   = 0;
+    uint64_t                                    computed_transaction_ = 0;
+    bool                                        external_mode_       = false;
     mutable bool                                failed_              = false;
 };

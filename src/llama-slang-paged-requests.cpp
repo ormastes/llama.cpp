@@ -158,6 +158,10 @@ llama_slang_paged_requests::staged_entry * llama_slang_paged_requests::staged_sl
     return staged_.data() + index * config_.max_pages_per_request;
 }
 
+const llama_slang_paged_requests::staged_entry * llama_slang_paged_requests::staged_slice(size_t index) const {
+    return staged_.data() + index * config_.max_pages_per_request;
+}
+
 float * llama_slang_paged_requests::published_logits_slice(size_t index) {
     return published_logits_.data() + index * config_.vocabulary_width;
 }
@@ -644,6 +648,59 @@ const float * llama_slang_paged_requests::logits(request_handle request) const {
 bool llama_slang_paged_requests::logits_valid(request_handle request) const {
     const request_record * record = find_request(request);
     return record != nullptr && record->logits_valid;
+}
+
+llama_slang_paged_requests::request_handle llama_slang_paged_requests::transaction_request(
+        transaction_handle transaction) const {
+    const transaction_record * record = find_transaction(transaction);
+    return record == nullptr ? 0 : record->request;
+}
+
+bool llama_slang_paged_requests::transaction_failed(transaction_handle transaction) const {
+    const transaction_record * record = find_transaction(transaction);
+    return record == nullptr || record->failed;
+}
+
+uint64_t llama_slang_paged_requests::transaction_append_position(transaction_handle transaction) const {
+    const transaction_record * record = find_transaction(transaction);
+    const request_record * request = record ? find_request(record->request) : nullptr;
+    if (record == nullptr || request == nullptr || record->failed || record->staged_count == 0) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const staged_entry * entries = staged_slice(request_index(*request));
+    for (uint32_t i = 0; i < record->staged_count; ++i) {
+        if (entries[i].writable_end > entries[i].valid_rows) {
+            const uint64_t page_offset = uint64_t(i) * pool_->config().page_tokens;
+            if (record->table_base > std::numeric_limits<uint64_t>::max() - page_offset ||
+                record->table_base + page_offset > std::numeric_limits<uint64_t>::max() - entries[i].valid_rows) {
+                return std::numeric_limits<uint64_t>::max();
+            }
+            return record->table_base + page_offset + entries[i].valid_rows;
+        }
+    }
+    const uint32_t last = record->staged_count - 1;
+    const uint64_t page_offset = uint64_t(last) * pool_->config().page_tokens;
+    if (record->table_base > std::numeric_limits<uint64_t>::max() - page_offset ||
+        record->table_base + page_offset > std::numeric_limits<uint64_t>::max() - entries[last].valid_rows) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return record->table_base + page_offset + entries[last].valid_rows;
+}
+
+uint64_t llama_slang_paged_requests::transaction_end_position(transaction_handle transaction) const {
+    const transaction_record * record = find_transaction(transaction);
+    const request_record * request = record ? find_request(record->request) : nullptr;
+    if (record == nullptr || request == nullptr || record->failed || record->staged_count == 0) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const staged_entry * entries = staged_slice(request_index(*request));
+    const uint32_t last = record->staged_count - 1;
+    const uint64_t page_offset = uint64_t(last) * pool_->config().page_tokens;
+    if (record->table_base > std::numeric_limits<uint64_t>::max() - page_offset ||
+        record->table_base + page_offset > std::numeric_limits<uint64_t>::max() - entries[last].writable_end) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return record->table_base + page_offset + entries[last].writable_end;
 }
 
 uint32_t llama_slang_paged_requests::execution_count(transaction_handle transaction) const {

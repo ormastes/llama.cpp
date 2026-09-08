@@ -85,12 +85,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params,
-        const llama_slang_paged_params * paged) :
+        const llama_slang_paged_params * paged,
+        const llama_slang_paged_provider_params * provider) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
-    graph_reuse_disable = paged != nullptr;
+    graph_reuse_disable = paged != nullptr || provider != nullptr;
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -396,9 +397,10 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(paged ? llama_memory_slang_paged_cache::create(model, params_mem, cparams, *paged).release() :
+        memory.reset(provider ? llama_memory_slang_paged_cache::create_external(model, params_mem, cparams, *provider).release() :
+                     paged ? llama_memory_slang_paged_cache::create(model, params_mem, cparams, *paged).release() :
                              model.create_memory(params_mem, cparams));
-        if (paged && !memory) {
+        if ((paged || provider) && !memory) {
             throw std::runtime_error("unsupported Slang paged context configuration");
         }
     }
@@ -801,6 +803,10 @@ bool llama_context::uses_slang_paged_memory() const {
     return dynamic_cast<llama_memory_slang_paged_cache *>(memory.get()) != nullptr;
 }
 
+llama_memory_slang_paged_cache * llama_context::slang_paged_cache() const {
+    return dynamic_cast<llama_memory_slang_paged_cache *>(memory.get());
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -862,6 +868,12 @@ enum llama_pooling_type llama_context::pooling_type() const {
 }
 
 float * llama_context::get_logits() {
+    auto * paged = slang_paged_cache();
+    if (paged && paged->external_mode()) {
+        LLAMA_LOG_ERROR("%s: external Slang paged contexts expose logits only through llama_slang_paged_logits_copy\n",
+                        __func__);
+        return nullptr;
+    }
     output_reorder();
 
     return logits.data;
@@ -897,6 +909,12 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
+    auto * paged = slang_paged_cache();
+    if (paged && paged->external_mode()) {
+        LLAMA_LOG_ERROR("%s: external Slang paged contexts expose logits only through llama_slang_paged_logits_copy\n",
+                        __func__);
+        return nullptr;
+    }
     output_reorder();
 
     try {
@@ -3695,14 +3713,15 @@ llama_context_params llama_context_default_params() {
 static llama_context * llama_init_from_model_impl(
                  llama_model * model,
         llama_context_params   params,
- const llama_slang_paged_params * paged) {
+ const llama_slang_paged_params * paged,
+ const llama_slang_paged_provider_params * provider) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
     }
 
-    if (paged && (params.n_samplers != 0 || params.samplers != nullptr || params.ctx_other != nullptr ||
-                  params.embeddings)) {
+    if ((paged || provider) && (params.n_samplers != 0 || params.samplers != nullptr || params.ctx_other != nullptr ||
+                               params.embeddings)) {
         LLAMA_LOG_ERROR("%s: unsupported Slang paged context option\n", __func__);
         return nullptr;
     }
@@ -3786,7 +3805,7 @@ static llama_context * llama_init_from_model_impl(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params, paged);
+        auto * ctx = new llama_context(*model, params, paged, provider);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -3806,14 +3825,21 @@ static llama_context * llama_init_from_model_impl(
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
-    return llama_init_from_model_impl(model, params, nullptr);
+    return llama_init_from_model_impl(model, params, nullptr, nullptr);
 }
 
 llama_context * llama_init_from_model_slang_paged(
                  llama_model * model,
         llama_context_params   params,
  llama_slang_paged_params      paged) {
-    return llama_init_from_model_impl(model, params, &paged);
+    return llama_init_from_model_impl(model, params, &paged, nullptr);
+}
+
+llama_context * llama_init_from_model_slang_paged_external(
+                 llama_model * model,
+        llama_context_params   params,
+ llama_slang_paged_provider_params provider) {
+    return llama_init_from_model_impl(model, params, nullptr, &provider);
 }
 
 // deprecated
@@ -4352,12 +4378,133 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    auto * paged = ctx->slang_paged_cache();
+    if (paged && paged->external_mode()) {
+        LLAMA_LOG_ERROR("%s: external Slang paged contexts require llama_slang_paged_decode\n", __func__);
+        return -1;
+    }
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
     return ret;
+}
+
+static llama_memory_slang_paged_cache * llama_slang_paged_external_cache(llama_context * ctx) {
+    auto * cache = ctx ? ctx->slang_paged_cache() : nullptr;
+    return cache && cache->external_mode() ? cache : nullptr;
+}
+
+int64_t llama_slang_paged_request_open(llama_context * ctx) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache ? cache->request_open() : -1;
+}
+
+int32_t llama_slang_paged_request_close(llama_context * ctx, int64_t request) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && request > 0 && cache->request_close(uint64_t(request)) ? 0 : -1;
+}
+
+int64_t llama_slang_paged_page_reserve(llama_context * ctx) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache ? cache->page_reserve() : -1;
+}
+
+int32_t llama_slang_paged_page_release(llama_context * ctx, int64_t page) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && page > 0 && cache->page_release(uint64_t(page)) ? 0 : -1;
+}
+
+int32_t llama_slang_paged_page_copy_tail(
+        llama_context * ctx, int64_t source, int64_t destination, uint32_t rows) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && source > 0 && destination > 0 &&
+                   cache->page_copy_tail(uint64_t(source), uint64_t(destination), rows) ? 0 : -1;
+}
+
+int64_t llama_slang_paged_table_begin(
+        llama_context * ctx, int64_t request, int64_t base_position, uint32_t expected_pages) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && request > 0 && base_position >= 0 ?
+        cache->table_begin(uint64_t(request), uint64_t(base_position), expected_pages) : -1;
+}
+
+int32_t llama_slang_paged_table_push(
+        llama_context * ctx, int64_t transaction, int64_t page, uint32_t valid_rows, uint32_t additional_rows) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    if (!cache || transaction <= 0) {
+        return -1;
+    }
+    if (page <= 0 || !cache->table_push(uint64_t(transaction), uint64_t(page), valid_rows, additional_rows)) {
+        cache->fail_external(uint64_t(transaction));
+        return -1;
+    }
+    return 0;
+}
+
+int32_t llama_slang_paged_decode(llama_context * ctx, int64_t transaction, llama_batch batch) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    if (!cache || transaction <= 0) {
+        return -1;
+    }
+    auto reject = [&]() {
+        cache->fail_external(uint64_t(transaction));
+        return int32_t(-1);
+    };
+    if (batch.n_tokens <= 0 || uint32_t(batch.n_tokens) > ctx->n_batch() ||
+        uint32_t(batch.n_tokens) > ctx->n_ubatch() || batch.token == nullptr || batch.embd != nullptr ||
+        batch.pos == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr || batch.logits == nullptr) {
+        return reject();
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr) {
+            return reject();
+        }
+    }
+    if (!cache->bind_transaction(uint64_t(transaction))) {
+        return reject();
+    }
+    if (cache->requests().transaction_failed(uint64_t(transaction))) {
+        cache->unbind_transaction(uint64_t(transaction));
+        return -1;
+    }
+    struct binding_guard {
+        llama_memory_slang_paged_cache * cache;
+        uint64_t transaction;
+        ~binding_guard() { cache->unbind_transaction(transaction); }
+    } guard{ cache, uint64_t(transaction) };
+    try {
+        const int32_t result = ctx->decode(batch);
+        if (result != 0) {
+            cache->fail_external(uint64_t(transaction));
+        }
+        return result == 0 ? 0 : -1;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: external decode failed: %s\n", __func__, error.what());
+        cache->fail_external(uint64_t(transaction));
+        return -1;
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: external decode failed with an unknown exception\n", __func__);
+        cache->fail_external(uint64_t(transaction));
+        return -1;
+    }
+}
+
+int32_t llama_slang_paged_commit(llama_context * ctx, int64_t transaction) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && transaction > 0 && cache->commit_external(uint64_t(transaction)) ? 0 : -1;
+}
+
+int32_t llama_slang_paged_abort(llama_context * ctx, int64_t transaction) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && transaction > 0 && cache->abort_external(uint64_t(transaction)) ? 0 : -1;
+}
+
+int32_t llama_slang_paged_logits_copy(
+        llama_context * ctx, int64_t request, float * destination, size_t count) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && request > 0 && cache->logits_copy(uint64_t(request), destination, count) ? 0 : -1;
 }
 
 //
