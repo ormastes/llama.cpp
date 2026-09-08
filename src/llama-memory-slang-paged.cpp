@@ -122,30 +122,44 @@ llama_slang_paged_pool::page_handle llama_slang_paged_pool::reserve() {
         return 0;
     }
     std::memset(available->data, 0, page_bytes_);
-    available->occupied = 0;
-    available->identity = identity;
-    available->state    = page_state::writable;
+    available->occupied                   = 0;
+    available->mapping_references         = 0;
+    available->read_borrows               = 0;
+    available->writable_owner             = 0;
+    available->exclusive_transaction      = 0;
+    available->exclusive_request          = 0;
+    available->exclusive_initial_occupied = 0;
+    available->identity                   = identity;
+    available->state                      = page_state::writable;
     allocated_bytes_ += page_bytes_;
     return identity;
 }
 
 bool llama_slang_paged_pool::release(page_handle handle) {
     page * page = find(handle);
-    if (page == nullptr) {
+    if (page == nullptr || page->mapping_references != 0 || page->read_borrows != 0 ||
+        page->exclusive_transaction != 0) {
         return false;
     }
     ::operator delete(page->data, std::align_val_t(64));
-    page->data     = nullptr;
-    page->identity = 0;
-    page->occupied = 0;
-    page->state    = page_state::free;
+    page->data                       = nullptr;
+    page->identity                   = 0;
+    page->occupied                   = 0;
+    page->mapping_references         = 0;
+    page->read_borrows               = 0;
+    page->writable_owner             = 0;
+    page->exclusive_transaction      = 0;
+    page->exclusive_request          = 0;
+    page->exclusive_initial_occupied = 0;
+    page->state                      = page_state::free;
     allocated_bytes_ -= page_bytes_;
     return true;
 }
 
 bool llama_slang_paged_pool::set_occupied(page_handle handle, uint32_t rows) {
     page * page = find(handle);
-    if (page == nullptr || page->state != page_state::writable || rows < page->occupied || rows > config_.page_tokens) {
+    if (page == nullptr || page->state != page_state::writable || page->mapping_references != 0 ||
+        page->exclusive_transaction != 0 || rows < page->occupied || rows > config_.page_tokens) {
         return false;
     }
     page->occupied = rows;
@@ -154,7 +168,8 @@ bool llama_slang_paged_pool::set_occupied(page_handle handle, uint32_t rows) {
 
 bool llama_slang_paged_pool::seal(page_handle handle) {
     page * page = find(handle);
-    if (page == nullptr || page->state != page_state::writable || page->occupied == 0) {
+    if (page == nullptr || page->state != page_state::writable || page->mapping_references != 0 ||
+        page->exclusive_transaction != 0 || page->occupied == 0) {
         return false;
     }
     page->state = page_state::sealed;
@@ -167,8 +182,9 @@ size_t llama_slang_paged_pool::row_offset(bool value, uint32_t layer, uint32_t r
 
 float * llama_slang_paged_pool::writable_row(page_handle handle, bool value, uint32_t layer, uint32_t row) {
     page * page = find(handle);
-    if (page == nullptr || page->state != page_state::writable || layer >= config_.n_layer ||
-        row >= config_.page_tokens || row < page->occupied) {
+    if (page == nullptr || page->state != page_state::writable || page->mapping_references != 0 ||
+        page->exclusive_transaction != 0 || layer >= config_.n_layer || row >= config_.page_tokens ||
+        row < page->occupied) {
         return nullptr;
     }
     return page->data + row_offset(value, layer, row);
@@ -176,7 +192,7 @@ float * llama_slang_paged_pool::writable_row(page_handle handle, bool value, uin
 
 const float * llama_slang_paged_pool::row(page_handle handle, bool value, uint32_t layer, uint32_t row) const {
     const page * page = find(handle);
-    if (page == nullptr || layer >= config_.n_layer || row >= page->occupied) {
+    if (page == nullptr || page->exclusive_transaction != 0 || layer >= config_.n_layer || row >= page->occupied) {
         return nullptr;
     }
     return page->data + row_offset(value, layer, row);
@@ -186,7 +202,8 @@ bool llama_slang_paged_pool::copy_rows(page_handle source, page_handle destinati
     const page * src = find(source);
     page *       dst = find(destination);
     if (src == nullptr || dst == nullptr || src == dst || src->state != page_state::sealed ||
-        dst->state != page_state::writable || dst->occupied != 0 || rows == 0 || rows > src->occupied ||
+        src->exclusive_transaction != 0 || dst->state != page_state::writable || dst->mapping_references != 0 ||
+        dst->exclusive_transaction != 0 || dst->occupied != 0 || rows == 0 || rows > src->occupied ||
         rows > config_.page_tokens) {
         return false;
     }
@@ -199,6 +216,136 @@ bool llama_slang_paged_pool::copy_rows(page_handle source, page_handle destinati
     return true;
 }
 
+bool llama_slang_paged_pool::map_for_request(page_handle handle, uint64_t request) {
+    page * page = find(handle);
+    if (page == nullptr || request == 0 || page->exclusive_transaction != 0 ||
+        page->mapping_references == std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (page->state == page_state::writable) {
+        if (page->mapping_references != 0 || page->writable_owner != 0) {
+            return false;
+        }
+        page->writable_owner = request;
+    }
+    ++page->mapping_references;
+    return true;
+}
+
+bool llama_slang_paged_pool::unmap_for_request(page_handle handle, uint64_t request) {
+    page * page = find(handle);
+    if (page == nullptr || request == 0 || page->exclusive_transaction != 0 || page->mapping_references == 0) {
+        return false;
+    }
+    if (page->state == page_state::writable) {
+        if (page->mapping_references != 1 || page->writable_owner != request) {
+            return false;
+        }
+        page->writable_owner = 0;
+    }
+    --page->mapping_references;
+    return true;
+}
+
+bool llama_slang_paged_pool::borrow_sealed(page_handle handle) {
+    page * page = find(handle);
+    if (page == nullptr || page->state != page_state::sealed || page->exclusive_transaction != 0 ||
+        page->read_borrows == std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    ++page->read_borrows;
+    return true;
+}
+
+bool llama_slang_paged_pool::return_sealed(page_handle handle) {
+    page * page = find(handle);
+    if (page == nullptr || page->state != page_state::sealed || page->read_borrows == 0) {
+        return false;
+    }
+    --page->read_borrows;
+    return true;
+}
+
+bool llama_slang_paged_pool::claim_exclusive(page_handle handle, uint64_t transaction, uint64_t request) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || request == 0 || page->state != page_state::writable ||
+        page->exclusive_transaction != 0 || page->read_borrows != 0 || page->mapping_references != 0 ||
+        page->writable_owner != 0) {
+        return false;
+    }
+    page->exclusive_transaction      = transaction;
+    page->exclusive_request          = request;
+    page->exclusive_initial_occupied = page->occupied;
+    return true;
+}
+
+bool llama_slang_paged_pool::abort_exclusive(page_handle handle, uint64_t transaction) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction) {
+        return false;
+    }
+    const size_t clear_rows  = config_.page_tokens - page->exclusive_initial_occupied;
+    const size_t clear_bytes = clear_rows * row_elements_ * sizeof(float);
+    for (uint32_t layer = 0; layer < config_.n_layer; ++layer) {
+        std::memset(page->data + row_offset(false, layer, page->exclusive_initial_occupied), 0, clear_bytes);
+        std::memset(page->data + row_offset(true, layer, page->exclusive_initial_occupied), 0, clear_bytes);
+    }
+    page->occupied                   = page->exclusive_initial_occupied;
+    page->state                      = page_state::writable;
+    page->exclusive_transaction      = 0;
+    page->exclusive_request          = 0;
+    page->exclusive_initial_occupied = 0;
+    return true;
+}
+
+bool llama_slang_paged_pool::publish_exclusive(page_handle handle, uint64_t transaction, uint64_t request) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || request == 0 || page->exclusive_transaction != transaction ||
+        page->exclusive_request != request || page->mapping_references != 0 || page->writable_owner != 0) {
+        return false;
+    }
+    page->mapping_references         = 1;
+    page->writable_owner             = page->state == page_state::writable ? request : 0;
+    page->exclusive_transaction      = 0;
+    page->exclusive_request          = 0;
+    page->exclusive_initial_occupied = 0;
+    return true;
+}
+
+bool llama_slang_paged_pool::set_occupied_exclusive(page_handle handle, uint64_t transaction, uint32_t rows) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction ||
+        page->state != page_state::writable || rows < page->occupied || rows > config_.page_tokens) {
+        return false;
+    }
+    page->occupied = rows;
+    return true;
+}
+
+bool llama_slang_paged_pool::seal_exclusive(page_handle handle, uint64_t transaction) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction ||
+        page->state != page_state::writable || page->occupied == 0) {
+        return false;
+    }
+    page->state = page_state::sealed;
+    return true;
+}
+
+float * llama_slang_paged_pool::writable_row_exclusive(page_handle handle,
+                                                       uint64_t    transaction,
+                                                       bool        value,
+                                                       uint32_t    layer,
+                                                       uint32_t    row) {
+    page * page = find(handle);
+    if (page == nullptr || transaction == 0 || page->exclusive_transaction != transaction ||
+        page->state != page_state::writable || layer >= config_.n_layer || row >= config_.page_tokens ||
+        row < page->occupied) {
+        return nullptr;
+    }
+    return page->data + row_offset(value, layer, row);
+}
+
 llama_slang_paged_pool::page_state llama_slang_paged_pool::state(page_handle handle) const {
     const page * page = find(handle);
     return page == nullptr ? page_state::free : page->state;
@@ -207,6 +354,21 @@ llama_slang_paged_pool::page_state llama_slang_paged_pool::state(page_handle han
 uint32_t llama_slang_paged_pool::occupied(page_handle handle) const {
     const page * page = find(handle);
     return page == nullptr ? 0 : page->occupied;
+}
+
+uint32_t llama_slang_paged_pool::mapping_references(page_handle handle) const {
+    const page * page = find(handle);
+    return page == nullptr ? 0 : page->mapping_references;
+}
+
+uint32_t llama_slang_paged_pool::read_borrows(page_handle handle) const {
+    const page * page = find(handle);
+    return page == nullptr ? 0 : page->read_borrows;
+}
+
+uint64_t llama_slang_paged_pool::exclusive_transaction(page_handle handle) const {
+    const page * page = find(handle);
+    return page == nullptr ? 0 : page->exclusive_transaction;
 }
 
 size_t llama_slang_paged_pool::page_bytes() const {
