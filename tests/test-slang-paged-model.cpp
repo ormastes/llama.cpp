@@ -309,10 +309,9 @@ void run_external_provider_case(llama_model *                model,
     push_page(external, transaction, shared_page, 4, 0);
     push_page(external, transaction, b_tail, 0, 2);
     if (!decode_external(external, transaction, b_suffix, 4) ||
-        llama_slang_paged_commit(external, transaction) != 0) {
+        llama_slang_paged_commit_and_copy(external, transaction, copied_logits.data(), copied_logits.size()) != 0) {
         fail("external B shared-prefix decode");
     }
-    copy_committed_logits(external, request_b, copied_logits);
     compare_logits_copy(legacy_b, copied_logits, n_vocab, "B shared prefix");
 
     std::vector<llama_token> a_next = { prompt[5] };
@@ -412,6 +411,19 @@ void run_external_provider_case(llama_model *                model,
     copy_committed_logits(external, request_a, copied_logits);
     compare_logits_copy(legacy_a, copied_logits, n_vocab, "A abort retry");
 
+    const int64_t sealed_copy = reserve_page(external);
+    if (llama_slang_paged_page_copy_tail(external, shared_page, sealed_copy, 4) != 0 ||
+        llama_slang_paged_page_seal(external, sealed_copy) != 0 ||
+        llama_slang_paged_page_seal(external, sealed_copy) == 0) {
+        fail("external explicit copy and seal");
+    }
+    const int64_t sealed_transaction = begin_table(external, request_b, 1);
+    push_page(external, sealed_transaction, sealed_copy, 4, 0);
+    if (llama_slang_paged_abort(external, sealed_transaction) != 0 ||
+        llama_slang_paged_page_release(external, sealed_copy) != 0) {
+        fail("external attach of explicitly sealed copy");
+    }
+
     if (llama_slang_paged_request_close(external, request_a) != 0 ||
         llama_slang_paged_request_close(external, request_b) != 0 ||
         llama_slang_paged_request_close(external, request_a) == 0) {
@@ -446,6 +458,55 @@ void run_external_provider_case(llama_model *                model,
         llama_slang_paged_page_release(external, bounded_page) != 0) {
         fail("external absolute-position bound");
     }
+
+    const int64_t atomic_request = llama_slang_paged_request_open(external);
+    std::vector<float> sentinel(size_t(n_vocab), 123.25f);
+    auto require_unchanged = [&]() {
+        if (!std::all_of(sentinel.begin(), sentinel.end(), [](float value) { return value == 123.25f; })) {
+            fail("failed atomic commit changed destination logits");
+        }
+    };
+    int64_t atomic_page = reserve_page(external);
+    transaction = begin_table(external, atomic_request, 1);
+    push_page(external, transaction, atomic_page, 0, 1);
+    if (llama_slang_paged_commit_and_copy(external, transaction, sentinel.data(), sentinel.size()) == 0 ||
+        llama_slang_paged_page_release(external, atomic_page) != 0) {
+        fail("premature atomic commit consumption");
+    }
+    require_unchanged();
+
+    atomic_page = reserve_page(external);
+    transaction = begin_table(external, atomic_request, 1);
+    push_page(external, transaction, atomic_page, 0, 1);
+    if (!decode_external(external, transaction, one, 0) ||
+        llama_slang_paged_commit_and_copy(external, transaction, sentinel.data(), sentinel.size() - 1) == 0 ||
+        llama_slang_paged_page_release(external, atomic_page) != 0) {
+        fail("wrong-count atomic commit consumption");
+    }
+    require_unchanged();
+
+    atomic_page = reserve_page(external);
+    transaction = begin_table(external, atomic_request, 1);
+    push_page(external, transaction, atomic_page, 0, 1);
+    if (!decode_external(external, transaction, one, 0) ||
+        llama_slang_paged_fail(external, transaction) != 0 ||
+        llama_slang_paged_commit_and_copy(external, transaction, sentinel.data(), sentinel.size()) == 0 ||
+        llama_slang_paged_page_release(external, atomic_page) != 0) {
+        fail("poisoned atomic commit consumption");
+    }
+    require_unchanged();
+
+    atomic_page = reserve_page(external);
+    transaction = begin_table(external, atomic_request, 2);
+    push_page(external, transaction, atomic_page, 0, 1);
+    if (!decode_external(external, transaction, one, 0) ||
+        llama_slang_paged_commit_and_copy(external, transaction, sentinel.data(), sentinel.size()) == 0 ||
+        llama_slang_paged_page_release(external, atomic_page) != 0 ||
+        llama_slang_paged_request_close(external, atomic_request) != 0) {
+        fail("incomplete atomic commit consumption");
+    }
+    require_unchanged();
+
     std::vector<int64_t> reserved;
     for (;;) {
         const int64_t page = llama_slang_paged_page_reserve(external);
