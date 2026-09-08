@@ -4396,6 +4396,10 @@ static llama_memory_slang_paged_cache * llama_slang_paged_external_cache(llama_c
     return cache && cache->external_mode() ? cache : nullptr;
 }
 
+int32_t llama_slang_paged_abi_version(void) {
+    return 1;
+}
+
 int64_t llama_slang_paged_request_open(llama_context * ctx) {
     auto * cache = llama_slang_paged_external_cache(ctx);
     return cache ? cache->request_open() : -1;
@@ -4414,6 +4418,11 @@ int64_t llama_slang_paged_page_reserve(llama_context * ctx) {
 int32_t llama_slang_paged_page_release(llama_context * ctx, int64_t page) {
     auto * cache = llama_slang_paged_external_cache(ctx);
     return cache && page > 0 && cache->page_release(uint64_t(page)) ? 0 : -1;
+}
+
+int32_t llama_slang_paged_page_seal(llama_context * ctx, int64_t page) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && page > 0 && cache->page_seal(uint64_t(page)) ? 0 : -1;
 }
 
 int32_t llama_slang_paged_page_copy_tail(
@@ -4491,9 +4500,21 @@ int32_t llama_slang_paged_decode(llama_context * ctx, int64_t transaction, llama
     }
 }
 
+int32_t llama_slang_paged_fail(llama_context * ctx, int64_t transaction) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && transaction > 0 && cache->fail_external(uint64_t(transaction)) ? 0 : -1;
+}
+
 int32_t llama_slang_paged_commit(llama_context * ctx, int64_t transaction) {
     auto * cache = llama_slang_paged_external_cache(ctx);
     return cache && transaction > 0 && cache->commit_external(uint64_t(transaction)) ? 0 : -1;
+}
+
+int32_t llama_slang_paged_commit_and_copy(
+        llama_context * ctx, int64_t transaction, float * destination, size_t count) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache && transaction > 0 && cache->commit_external_and_copy(
+        uint64_t(transaction), destination, count) ? 0 : -1;
 }
 
 int32_t llama_slang_paged_abort(llama_context * ctx, int64_t transaction) {
@@ -4505,6 +4526,11 @@ int32_t llama_slang_paged_logits_copy(
         llama_context * ctx, int64_t request, float * destination, size_t count) {
     auto * cache = llama_slang_paged_external_cache(ctx);
     return cache && request > 0 && cache->logits_copy(uint64_t(request), destination, count) ? 0 : -1;
+}
+
+size_t llama_slang_paged_page_bytes(llama_context * ctx) {
+    auto * cache = llama_slang_paged_external_cache(ctx);
+    return cache ? cache->page_bytes() : 0;
 }
 
 //

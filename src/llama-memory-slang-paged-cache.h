@@ -89,6 +89,7 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
     bool request_close(uint64_t request);
     int64_t page_reserve();
     bool page_release(uint64_t page);
+    bool page_seal(uint64_t page);
     bool page_copy_tail(uint64_t source, uint64_t destination, uint32_t rows);
     int64_t table_begin(uint64_t request, uint64_t base_position, uint32_t expected_pages);
     bool table_push(uint64_t transaction, uint64_t page, uint32_t valid_rows, uint32_t additional_rows);
@@ -96,8 +97,10 @@ class llama_memory_slang_paged_cache final : public llama_memory_i {
     void unbind_transaction(uint64_t transaction);
     bool fail_external(uint64_t transaction);
     bool commit_external(uint64_t transaction);
+    bool commit_external_and_copy(uint64_t transaction, float * destination, size_t count);
     bool abort_external(uint64_t transaction);
     bool logits_copy(uint64_t request, float * destination, size_t count) const;
+    size_t page_bytes() const;
     bool                          finish(llama_slang_paged_requests::transaction_handle transaction,
                                          const float *                                  logits,
                                          uint32_t                                       count,

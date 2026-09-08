@@ -34,6 +34,8 @@ struct llama_slang_paged_provider_params {
     size_t   logits_byte_limit;
 };
 
+LLAMA_API int32_t llama_slang_paged_abi_version(void);
+
 LLAMA_API struct llama_context * llama_init_from_model_slang_paged(struct llama_model *            model,
                                                                    struct llama_context_params     params,
                                                                    struct llama_slang_paged_params paged);
@@ -59,6 +61,7 @@ LLAMA_API int32_t llama_slang_paged_request_close(struct llama_context * ctx, in
 
 LLAMA_API int64_t llama_slang_paged_page_reserve(struct llama_context * ctx);
 LLAMA_API int32_t llama_slang_paged_page_release(struct llama_context * ctx, int64_t page);
+LLAMA_API int32_t llama_slang_paged_page_seal(struct llama_context * ctx, int64_t page);
 LLAMA_API int32_t llama_slang_paged_page_copy_tail(
     struct llama_context * ctx, int64_t source, int64_t destination, uint32_t rows);
 
@@ -69,11 +72,15 @@ LLAMA_API int32_t llama_slang_paged_table_push(
 
 LLAMA_API int32_t llama_slang_paged_decode(
     struct llama_context * ctx, int64_t transaction, struct llama_batch batch);
+LLAMA_API int32_t llama_slang_paged_fail(struct llama_context * ctx, int64_t transaction);
 LLAMA_API int32_t llama_slang_paged_commit(struct llama_context * ctx, int64_t transaction);
+LLAMA_API int32_t llama_slang_paged_commit_and_copy(
+    struct llama_context * ctx, int64_t transaction, float * destination, size_t count);
 LLAMA_API int32_t llama_slang_paged_abort(struct llama_context * ctx, int64_t transaction);
 
 LLAMA_API int32_t llama_slang_paged_logits_copy(
     struct llama_context * ctx, int64_t request, float * destination, size_t count);
+LLAMA_API size_t llama_slang_paged_page_bytes(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

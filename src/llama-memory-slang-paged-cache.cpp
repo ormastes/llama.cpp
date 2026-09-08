@@ -496,6 +496,10 @@ bool llama_memory_slang_paged_cache::page_release(uint64_t page) {
     return external_mode_ && page != 0 && pool_->release(page);
 }
 
+bool llama_memory_slang_paged_cache::page_seal(uint64_t page) {
+    return external_mode_ && page != 0 && pool_->seal(page);
+}
+
 bool llama_memory_slang_paged_cache::page_copy_tail(uint64_t source, uint64_t destination, uint32_t rows) {
     return external_mode_ && source != 0 && destination != 0 && pool_->copy_rows(source, destination, rows);
 }
@@ -562,6 +566,29 @@ bool llama_memory_slang_paged_cache::commit_external(uint64_t transaction) {
     return ok;
 }
 
+bool llama_memory_slang_paged_cache::commit_external_and_copy(
+        uint64_t transaction, float * destination, size_t count) {
+    if (!external_mode_ || transaction == 0 || requests_->transaction_request(transaction) == 0) {
+        return false;
+    }
+    if (destination == nullptr || count != vocabulary_width_ || count > UINT32_MAX ||
+        computed_transaction_ != transaction || requests_->transaction_failed(transaction)) {
+        fail_external(transaction);
+        (void)commit_external(transaction);
+        return false;
+    }
+    const uint64_t request = requests_->transaction_request(transaction);
+    if (!commit_external(transaction)) {
+        return false;
+    }
+    const float * logits = requests_->logits(request);
+    if (logits == nullptr) {
+        std::abort();
+    }
+    std::memcpy(destination, logits, count * sizeof(float));
+    return true;
+}
+
 bool llama_memory_slang_paged_cache::abort_external(uint64_t transaction) {
     if (!external_mode_ || transaction == 0 || bound_transaction_ == transaction) {
         return false;
@@ -584,6 +611,10 @@ bool llama_memory_slang_paged_cache::logits_copy(uint64_t request, float * desti
     }
     std::memcpy(destination, logits, count * sizeof(float));
     return true;
+}
+
+size_t llama_memory_slang_paged_cache::page_bytes() const {
+    return external_mode_ ? pool_->page_bytes() : 0;
 }
 
 bool llama_memory_slang_paged_cache::finish(llama_slang_paged_requests::transaction_handle transaction,
